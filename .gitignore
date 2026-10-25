@@ -1,0 +1,7 @@
+# Base SQLite heredada de la versión web (respaldo local; no se publica)
+/experimentos.db
+.venv/
+.DS_Store
+__pycache__/
+build/
+dist/

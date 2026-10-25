@@ -1,0 +1,22 @@
+# --- Python compilado ---
+__pycache__/
+*.py[cod]
+
+# --- Entornos virtuales locales ---
+.venv/
+venv/
+env/
+
+# --- PyInstaller: artefactos generados al compilar ---
+# (BioGrow_Analytics.spec SÍ se versiona: es la configuración de compilación)
+build/
+dist/
+
+# --- Base SQLite heredada (respaldo local de la versión anterior; no se publica) ---
+/experimentos.db
+
+# --- Temporales ---
+*.tmp
+*.log
+*~
+Thumbs.db
