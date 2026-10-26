@@ -6,6 +6,7 @@ interfaz.py — Interfaz gráfica de BioGrow Desktop
 - Modo Administrador con Edición y Eliminación de registros y lotes.
 - Exportación a Excel (.xlsx) y PDF (.pdf) con diseño profesional.
 """
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import customtkinter as ctk
@@ -31,15 +32,10 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-from analytics_engine import (
-    cargar_archivos_excel,
-    convertir_mysql_a_df,
-    combinar_fuentes,
-    preparar_datos_analisis,
-    ejecutar_suite_completa,
-    generar_texto_conclusion,
-    SIG,
-)
+# Análisis y gráficas: mismos cálculos que el dashboard (dashboardst.py)
+import analisis_biogrow as AN
+import graficas_biogrow as GR
+import reporte_biogrow as REP
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -1971,7 +1967,8 @@ class BioGrowApp(ctk.CTk):
         canvas.get_tk_widget().pack(fill="both", expand=True, padx=15, pady=15)
 
     # -----------------------------------------------------------------------
-    # Gestión Híbrida de Datos (MySQL + Archivos Excel de dashboardst.py)
+    # Datos para el análisis: base de datos (pestaña 1) + archivos Excel
+    # Los cálculos son los mismos del dashboard (motor_biogrow.py, vía analisis_biogrow.py)
     # -----------------------------------------------------------------------
 
     def _cargar_excels_externos(self) -> None:
@@ -1982,777 +1979,615 @@ class BioGrowApp(ctk.CTk):
         )
         if not rutas:
             return
-
         for r in rutas:
             if r not in self._archivos_excel_cargados:
                 self._archivos_excel_cargados.append(r)
-
-        self._df_excel_cache, self._advertencias_excel = cargar_archivos_excel(self._archivos_excel_cargados)
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            self._df_excel_cache, self._advertencias_excel = AN.leer_excels(self._archivos_excel_cargados)
+        finally:
+            self.configure(cursor="")
         n_arch = len(self._archivos_excel_cargados)
         n_filas = len(self._df_excel_cache)
-
-        if hasattr(self, "_lbl_estado_excel"):
-            self._lbl_estado_excel.configure(text=f"📂 {n_arch} Excel ({n_filas} semillas)")
-
-        self._var_fuente_datos.set("MySQL + Excel (Combinados)" if not self._df_excel_cache.empty else "Solo MySQL")
+        self._lbl_estado_excel.configure(text=f"📂 {n_arch} Excel ({n_filas} semillas)")
+        if not self._df_excel_cache.empty and self._var_fuente_datos.get() == "Solo MySQL":
+            self._var_fuente_datos.set("MySQL + Excel (Combinados)")
+        self._unidad_tocada = False
         self._ejecutar_analisis_ui()
 
-        msg = f"Se cargaron {n_arch} archivo(s) Excel con {n_filas} mediciones reconocidas."
+        msg = f"Se cargaron {n_arch} archivo(s) Excel con {n_filas} semillas reconocidas."
         if self._advertencias_excel:
-            msg += "\n\nNotas del lector:\n• " + "\n• ".join(self._advertencias_excel[:6])
+            msg += "\n\nNotas del lector:\n• " + "\n• ".join(self._advertencias_excel[:8])
         messagebox.showinfo("Archivos Excel Cargados", msg, parent=self)
 
     def _limpiar_excels_externos(self) -> None:
         self._archivos_excel_cargados.clear()
         self._df_excel_cache = pd.DataFrame()
-        self._advertencias_excel.clear()
-        if hasattr(self, "_lbl_estado_excel"):
-            self._lbl_estado_excel.configure(text="📂 0 Excel cargados")
+        self._advertencias_excel = []
+        self._lbl_estado_excel.configure(text="📂 0 Excel cargados")
         self._var_fuente_datos.set("Solo MySQL")
+        self._unidad_tocada = False
         self._ejecutar_analisis_ui()
 
     def _obtener_dataframe_activo(self) -> pd.DataFrame:
-        registros_db = self.db.obtener_historial_con_id()
-        df_mysql = convertir_mysql_a_df(registros_db)
+        """Datos según la fuente elegida, leídos con el mismo lector del dashboard (en cm)."""
         modo = self._var_fuente_datos.get() if hasattr(self, "_var_fuente_datos") else "Solo MySQL"
-        df = combinar_fuentes(df_mysql, self._df_excel_cache, modo)
-
-        # Filtro de variedad si está seleccionado
-        if not df.empty and hasattr(self, "_var_filtro_var_calc"):
-            f_var = self._var_filtro_var_calc.get()
-            if f_var and f_var != "Todas las variedades":
-                df = df[df["Variedad"].astype(str).str.contains(f_var, case=False, na=False)].copy()
-        return df
+        df_bd = pd.DataFrame()
+        if not modo.startswith("Solo Excel"):
+            registros = self.db.obtener_historial_con_id()
+            firma = (len(registros), max((r.get("medicion_id") or 0 for r in registros), default=0),
+                     hash(tuple((r.get("medicion_id"), r.get("longitud_raiz"), r.get("longitud_tallo"),
+                                 r.get("germino"), r.get("tiempo_tratamiento"), r.get("temperatura"),
+                                 r.get("nombre_lote"), r.get("tipo_semilla")) for r in registros)))
+            if getattr(self, "_firma_bd", None) != firma:
+                self._df_bd_cache, _ = AN.leer_base(registros)
+                self._firma_bd = firma
+            df_bd = self._df_bd_cache
+        return AN.combinar(df_bd, self._df_excel_cache, modo)
 
     # -----------------------------------------------------------------------
-    # Página 2: Cálculos y Modelos (ANOVA, Tukey, LSD, Cuartiles y Descriptivos)
+    # Página 2: Cálculos y Modelos (lo mismo que muestra el dashboard)
     # -----------------------------------------------------------------------
+
+    def _etiqueta_control(self, padre, texto):
+        ctk.CTkLabel(padre, text=texto, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                     text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
 
     def _construir_seccion_calculos(self, padre: ctk.CTkFrame) -> None:
         padre.grid_columnconfigure(0, weight=1)
         padre.grid_rowconfigure(2, weight=1)
+        self._unidad_tocada = False
+        self._df_bd_cache = pd.DataFrame()
+        recalcular = lambda *_: self._ejecutar_analisis_ui()
 
-        # 1. Barra de Control Estadístico y Fuente de Datos
-        ctrl = ctk.CTkFrame(
-            padre, fg_color=UI_COLORS["bg_card"],
-            corner_radius=12, border_width=1, border_color=UI_COLORS["border"]
-        )
+        ctrl = ctk.CTkFrame(padre, fg_color=UI_COLORS["bg_card"], corner_radius=12,
+                            border_width=1, border_color=UI_COLORS["border"])
         ctrl.grid(row=0, column=0, pady=(0, 8), sticky="ew")
-        ctrl.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
 
-        # Fila 0: Fuente de datos + Botones Excel
+        # Fila 1: fuente de datos y archivos Excel
         top_bar = ctk.CTkFrame(ctrl, fg_color="transparent")
-        top_bar.grid(row=0, column=0, columnspan=6, padx=16, pady=(12, 6), sticky="ew")
-
-        ctk.CTkLabel(
-            top_bar, text="🗄️ Fuente de Datos:",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color=UI_COLORS["text_primary"]
-        ).pack(side="left", padx=(0, 8))
-
+        top_bar.pack(fill="x", padx=16, pady=(12, 4))
+        ctk.CTkLabel(top_bar, text="🗄️ Fuente de Datos:", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                     text_color=UI_COLORS["text_primary"]).pack(side="left", padx=(0, 8))
         self._var_fuente_datos = tk.StringVar(value="Solo MySQL")
         ctk.CTkSegmentedButton(
-            top_bar,
-            values=["Solo MySQL", "MySQL + Excel (Combinados)", "Solo Excel"],
-            variable=self._var_fuente_datos,
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            selected_color=UI_COLORS["accent_indigo"],
-            command=lambda _: self._ejecutar_analisis_ui(),
+            top_bar, values=["Solo MySQL", "MySQL + Excel (Combinados)", "Solo Excel"],
+            variable=self._var_fuente_datos, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            selected_color=UI_COLORS["accent_indigo"], command=recalcular,
         ).pack(side="left", padx=(0, 12))
-
-        ctk.CTkButton(
-            top_bar, text="➕ Cargar / Combinar Excel (.xlsx)",
-            height=30, fg_color=UI_COLORS["accent_green"], hover_color=UI_COLORS["accent_hover"],
-            text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
-            command=self._cargar_excels_externos,
-        ).pack(side="left", padx=(0, 6))
-
-        ctk.CTkButton(
-            top_bar, text="🧹 Quitar Excel", width=95, height=30,
-            fg_color=UI_COLORS["bg_secondary"], text_color=UI_COLORS["text_primary"],
-            hover_color=UI_COLORS["border"], font=ctk.CTkFont(size=11),
-            command=self._limpiar_excels_externos,
-        ).pack(side="left", padx=(0, 10))
-
-        self._lbl_estado_excel = ctk.CTkLabel(
-            top_bar, text="📂 0 Excel cargados",
-            font=ctk.CTkFont(size=11), text_color=UI_COLORS["text_secondary"]
-        )
+        ctk.CTkButton(top_bar, text="➕ Cargar / Combinar Excel (.xlsx)", height=30,
+                      fg_color=UI_COLORS["accent_green"], hover_color=UI_COLORS["accent_hover"],
+                      text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._cargar_excels_externos).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(top_bar, text="🧹 Quitar Excel", width=95, height=30, fg_color=UI_COLORS["bg_secondary"],
+                      text_color=UI_COLORS["text_primary"], hover_color=UI_COLORS["border"],
+                      font=ctk.CTkFont(size=11), command=self._limpiar_excels_externos).pack(side="left", padx=(0, 10))
+        self._lbl_estado_excel = ctk.CTkLabel(top_bar, text="📂 0 Excel cargados", font=ctk.CTkFont(size=11),
+                                              text_color=UI_COLORS["text_secondary"])
         self._lbl_estado_excel.pack(side="left", padx=(4, 0))
+        ctk.CTkButton(top_bar, text="🔄 Recalcular", width=100, height=30, fg_color=UI_COLORS["accent_indigo"],
+                      text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._ejecutar_analisis_ui).pack(side="right")
+        ctk.CTkButton(top_bar, text="📄 Reporte PDF de los cálculos", width=190, height=30,
+                      fg_color=UI_COLORS["accent_red"], hover_color="#b91c1c", text_color="#ffffff",
+                      font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._exportar_reporte_calculos).pack(side="right", padx=(0, 8))
 
-        ctk.CTkButton(
-            top_bar, text="🔄 Recalcular", width=100, height=30,
-            fg_color=UI_COLORS["accent_indigo"], text_color="#ffffff",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            command=self._ejecutar_analisis_ui,
-        ).pack(side="right")
-
-        # Fila 1: Parámetros del modelo estadístico
+        # Fila 2: qué analizar
         param_bar = ctk.CTkFrame(ctrl, fg_color="transparent")
-        param_bar.grid(row=1, column=0, columnspan=6, padx=16, pady=(4, 12), sticky="ew")
-
-        # Variable
-        ctk.CTkLabel(param_bar, text="Variable:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+        param_bar.pack(fill="x", padx=16, pady=4)
+        self._etiqueta_control(param_bar, "Variable:")
         self._var_variable_calc = tk.StringVar(value="Raíz")
-        ctk.CTkComboBox(
-            param_bar, variable=self._var_variable_calc,
-            values=["Raíz", "Tallo", "Hojas", "Germinó"], width=120, state="readonly",
-            command=lambda _: self._ejecutar_analisis_ui()
-        ).pack(side="left", padx=(0, 12))
-
-        # Comparar por
-        ctk.CTkLabel(param_bar, text="Comparar por:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
-        self._var_agrupacion_calc = tk.StringVar(value="Tratamiento")
-        ctk.CTkComboBox(
-            param_bar, variable=self._var_agrupacion_calc,
-            values=[
-                "Tratamiento",
-                "Variedad de Semilla",
-                "Lote / Hoja",
-                "Parte Expuesta (Clase)",
-                "Tratamiento + Variedad",
-                "Origen (MySQL vs Excel)",
-            ],
-            width=185, state="readonly",
-            command=lambda _: self._ejecutar_analisis_ui()
-        ).pack(side="left", padx=(0, 12))
-
-        # Filtro de variedad
-        ctk.CTkLabel(param_bar, text="Filtrar Variedad:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+        ctk.CTkComboBox(param_bar, variable=self._var_variable_calc, values=["Raíz", "Tallo", "Germinó"],
+                        width=105, state="readonly", command=recalcular).pack(side="left", padx=(0, 12))
+        self._etiqueta_control(param_bar, "Comparar por:")
+        self._var_agrupacion_calc = tk.StringVar(value=list(AN.OPCIONES_COMPARAR)[0])
+        ctk.CTkComboBox(param_bar, variable=self._var_agrupacion_calc, values=list(AN.OPCIONES_COMPARAR),
+                        width=265, state="readonly", command=recalcular).pack(side="left", padx=(0, 12))
+        self._etiqueta_control(param_bar, "Variedad:")
         self._var_filtro_var_calc = tk.StringVar(value="Todas las variedades")
-        ctk.CTkComboBox(
-            param_bar, variable=self._var_filtro_var_calc,
-            values=["Todas las variedades", "blanco", "rosa", "cacahuazintle", "criollo", "lenteja"],
-            width=155, state="readonly",
-            command=lambda _: self._ejecutar_analisis_ui()
-        ).pack(side="left", padx=(0, 12))
-
-        # Unidad experimental
-        ctk.CTkLabel(param_bar, text="Réplica:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
-        self._var_unidad_calc = tk.StringVar(value="Por Caja/Lote (Recomendado)")
-        ctk.CTkComboBox(
+        self._cmb_variedad_calc = ctk.CTkComboBox(param_bar, variable=self._var_filtro_var_calc,
+                                                  values=["Todas las variedades"], width=185, state="readonly",
+                                                  command=recalcular)
+        self._cmb_variedad_calc.pack(side="left", padx=(0, 12))
+        self._etiqueta_control(param_bar, "Cada dato es:")
+        self._var_unidad_calc = tk.StringVar(value="Por caja (promedio de sus semillas)")
+        self._cmb_unidad_calc = ctk.CTkComboBox(
             param_bar, variable=self._var_unidad_calc,
-            values=["Por Caja/Lote (Recomendado)", "Por Semilla Individual"],
-            width=195, state="readonly",
-            command=lambda _: self._ejecutar_analisis_ui()
-        ).pack(side="left", padx=(0, 12))
+            values=["Por caja (promedio de sus semillas)", "Por semilla"], width=235, state="readonly",
+            command=recalcular)
+        self._cmb_unidad_calc.pack(side="left", padx=(0, 12))
+        self._etiqueta_control(param_bar, "Unidad:")
+        self._var_long_calc = tk.StringVar(value="mm")
 
-        # Nivel alfa
-        ctk.CTkLabel(param_bar, text="α:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+        def _unidad_cambiada(_=None):
+            self._unidad_tocada = True
+            self._ejecutar_analisis_ui()
+        ctk.CTkSegmentedButton(param_bar, values=["mm", "cm"], variable=self._var_long_calc, width=80,
+                               command=_unidad_cambiada).pack(side="left", padx=(0, 12))
+        self._etiqueta_control(param_bar, "α:")
         self._var_alfa_calc = tk.StringVar(value="0.05")
-        ctk.CTkComboBox(
-            param_bar, variable=self._var_alfa_calc,
-            values=["0.05", "0.01"], width=75, state="readonly",
-            command=lambda _: self._ejecutar_analisis_ui()
-        ).pack(side="left", padx=(0, 12))
+        ctk.CTkSegmentedButton(param_bar, values=["0.05", "0.01"], variable=self._var_alfa_calc, width=100,
+                               command=recalcular).pack(side="left")
 
-        # Checkboxes de limpieza
-        self._var_excluir_nogerm = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            param_bar, text="Excluir no germinadas (0 mm)", variable=self._var_excluir_nogerm,
-            font=ctk.CTkFont(size=11), checkbox_width=18, checkbox_height=18,
-            command=self._ejecutar_analisis_ui
-        ).pack(side="left", padx=(0, 10))
-
+        # Fila 3: descartes (mismas reglas del dashboard)
+        desc_bar = ctk.CTkFrame(ctrl, fg_color="transparent")
+        desc_bar.pack(fill="x", padx=16, pady=(4, 12))
+        self._etiqueta_control(desc_bar, "🧹 Semillas que no germinaron:")
+        self._var_no_germ = tk.StringVar(value="Excluirlas del promedio")
+        ctk.CTkSegmentedButton(desc_bar, values=["Excluirlas del promedio", "Incluirlas con longitud 0"],
+                               variable=self._var_no_germ, command=recalcular).pack(side="left", padx=(0, 14))
+        self._var_ceros = tk.BooleanVar(value=False)
         self._var_excluir_atipicos = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            param_bar, text="Quitar atípicos (1.5×IQR)", variable=self._var_excluir_atipicos,
-            font=ctk.CTkFont(size=11), checkbox_width=18, checkbox_height=18,
-            command=self._ejecutar_analisis_ui
-        ).pack(side="left")
+        self._var_cajas_vacias = tk.BooleanVar(value=True)
+        for texto, var in [("Excluir germinadas con valor = 0", self._var_ceros),
+                           ("Excluir atípicos de cada grupo (1.5×IQR)", self._var_excluir_atipicos),
+                           ("Excluir cajas vacías", self._var_cajas_vacias)]:
+            ctk.CTkCheckBox(desc_bar, text=texto, variable=var, font=ctk.CTkFont(size=11),
+                            checkbox_width=18, checkbox_height=18, command=recalcular).pack(side="left", padx=(0, 14))
 
-        # 2. Banner de dictamen rápido ANOVA
+        # Dictamen y conclusión
         self._txt_conclusion_anova = ctk.CTkTextbox(
-            padre, height=82, fg_color=UI_COLORS["bg_card"],
-            border_width=1, border_color=UI_COLORS["border"],
-            text_color=UI_COLORS["text_primary"],
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            corner_radius=10,
-        )
+            padre, height=58, fg_color=UI_COLORS["bg_card"], border_width=1, border_color=UI_COLORS["border"],
+            text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(family="Segoe UI", size=12),
+            corner_radius=10, wrap="word")
         self._txt_conclusion_anova.grid(row=1, column=0, pady=(0, 8), sticky="ew")
 
-        # 3. Sub-pestañas con las 5 tablas estadísticas de dashboardst.py
+        # Sub-pestañas con las mismas secciones del dashboard
         self._tabs_estadistica = ctk.CTkTabview(
-            padre,
-            fg_color=UI_COLORS["bg_card"],
-            segmented_button_fg_color=UI_COLORS["bg_secondary"],
+            padre, fg_color=UI_COLORS["bg_card"], segmented_button_fg_color=UI_COLORS["bg_secondary"],
             segmented_button_selected_color=UI_COLORS["accent_green"],
-            segmented_button_unselected_color=UI_COLORS["bg_secondary"],
-            text_color=UI_COLORS["text_primary"],
-            corner_radius=12,
-            border_width=1,
-            border_color=UI_COLORS["border"],
-        )
+            segmented_button_unselected_color=UI_COLORS["bg_secondary"], text_color=UI_COLORS["text_primary"],
+            corner_radius=12, border_width=1, border_color=UI_COLORS["border"])
         self._tabs_estadistica.grid(row=2, column=0, sticky="nsew")
+        t_res = self._tabs_estadistica.add("📌 Resumen")
+        t_desc = self._tabs_estadistica.add("📊 Promedio, DE y varianza")
+        t_anov = self._tabs_estadistica.add("🧮 ANOVA")
+        t_tuk = self._tabs_estadistica.add("🔠 Tukey")
+        t_lsd = self._tabs_estadistica.add("🔡 LSD")
 
-        t_rank = self._tabs_estadistica.add("🏆 1. Ranking, Media, DE y Letras")
-        t_anov = self._tabs_estadistica.add("🧮 2. Tabla ANOVA (1 Vía)")
-        t_tuk  = self._tabs_estadistica.add("🔠 3. Prueba de Tukey HSD")
-        t_lsd  = self._tabs_estadistica.add("🔡 4. Prueba LSD de Fisher")
-        t_cuar = self._tabs_estadistica.add("📦 5. Análisis por Cuartiles e IQR")
+        def _nota(contenedor, fila=0, texto=""):
+            lbl = ctk.CTkLabel(contenedor, text=texto, anchor="w", justify="left", wraplength=1380,
+                               font=ctk.CTkFont(family="Segoe UI", size=11), text_color=UI_COLORS["text_secondary"])
+            lbl.grid(row=fila, column=0, sticky="ew", padx=6, pady=(2, 4))
+            return lbl
 
-        self._tree_ranking = self._crear_treeview_estadistico(
-            t_rank,
-            [("Lugar", 55), ("Grupo", 180), ("n", 60), ("Promedio ± DE", 140),
-             ("Varianza", 95), ("CV %", 80), ("% Germ.", 130), ("Tukey", 80), ("LSD", 80)]
-        )
-        self._tree_anova = self._crear_treeview_estadistico(
-            t_anov,
-            [("Fuente", 210), ("GL", 65), ("SC", 110), ("CM", 110),
-             ("F calc", 95), ("F crít", 95), ("Comparación", 140), ("p-valor", 95), ("Conclusión", 140)]
-        )
-        self._tree_tukey = self._crear_treeview_estadistico(
-            t_tuk,
-            [("Grupo 1", 160), ("Grupo 2", 160), ("Conclusión", 120), ("|Diferencia|", 95),
-             ("DHS", 95), ("Comparación", 130), ("q calc", 85), ("q crít", 85), ("p ajustada", 95)]
-        )
-        self._tree_lsd = self._crear_treeview_estadistico(
-            t_lsd,
-            [("Grupo 1", 160), ("Grupo 2", 160), ("Conclusión", 120), ("|Diferencia|", 95),
-             ("LSD", 95), ("Comparación", 130), ("t calc", 85), ("t crít", 85), ("p-valor", 95)]
-        )
-        self._tree_cuartiles = self._crear_treeview_estadistico(
-            t_cuar,
-            [("Grupo", 170), ("n", 55), ("Mínimo", 80), ("Q1", 80), ("Mediana", 85),
-             ("Q3", 80), ("Máximo", 80), ("IQR", 80), ("Lím. Inf", 85), ("Lím. Sup", 85),
-             ("Atípicos", 75), ("Bowley", 80), ("Forma", 160)]
-        )
+        for t in (t_res, t_desc, t_anov, t_tuk, t_lsd):
+            t.grid_columnconfigure(0, weight=1)
 
-    def _crear_treeview_estadistico(self, contenedor, columnas_cfg: list) -> ttk.Treeview:
-        contenedor.grid_columnconfigure(0, weight=1)
-        contenedor.grid_rowconfigure(0, weight=1)
-        cols = [c[0] for c in columnas_cfg]
-        tree = ttk.Treeview(contenedor, columns=cols, show="headings", style="BioGrow.Treeview")
-        for nombre, ancho in columnas_cfg:
-            tree.heading(nombre, text=nombre, anchor="center")
-            tree.column(nombre, width=ancho, minwidth=50, anchor="center", stretch=True)
+        t_res.grid_rowconfigure(1, weight=3)
+        t_res.grid_rowconfigure(3, weight=1)
+        self._nota_resumen = _nota(t_res, 0, "Grupos que comparten una letra no difieren entre sí. Tukey es la "
+                                   "prueba más estricta; LSD separa más grupos.")
+        self._tree_ranking = self._crear_tabla_estadistica(t_res, 1)
+        ctk.CTkLabel(t_res, text="¿Qué grupos difieren? (Tukey)", anchor="w",
+                     font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                     text_color=UI_COLORS["text_primary"]).grid(row=2, column=0, sticky="ew", padx=6, pady=(6, 0))
+        self._txt_pares = ctk.CTkTextbox(t_res, height=90, fg_color=UI_COLORS["bg_secondary"], wrap="word",
+                                         text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(size=11))
+        self._txt_pares.grid(row=3, column=0, sticky="nsew", padx=6, pady=(2, 6))
 
-        vsb = ttk.Scrollbar(contenedor, orient="vertical", command=tree.yview, style="Dark.Vertical.TScrollbar")
-        hsb = ttk.Scrollbar(contenedor, orient="horizontal", command=tree.xview, style="Dark.Horizontal.TScrollbar")
+        t_desc.grid_rowconfigure(1, weight=1)
+        _nota(t_desc, 0, "Varianza y desviación estándar muestrales (se divide entre n − 1). "
+                         "CV = DE como % del promedio. Error estándar = DE / √n.")
+        self._tree_desc = self._crear_tabla_estadistica(t_desc, 1)
+
+        t_anov.grid_rowconfigure(1, weight=1)
+        self._nota_anova = _nota(t_anov)
+        self._tree_anova = self._crear_tabla_estadistica(t_anov, 1)
+
+        t_tuk.grid_rowconfigure(1, weight=3)
+        t_tuk.grid_rowconfigure(3, weight=2)
+        self._nota_tukey = _nota(t_tuk)
+        self._tree_tukey = self._crear_tabla_estadistica(t_tuk, 1)
+        _nota(t_tuk, 2, "Letras de Tukey (misma letra = no difieren):")
+        self._tree_letras_tukey = self._crear_tabla_estadistica(t_tuk, 3)
+
+        t_lsd.grid_rowconfigure(1, weight=3)
+        t_lsd.grid_rowconfigure(3, weight=2)
+        self._nota_lsd = _nota(t_lsd)
+        self._tree_lsd = self._crear_tabla_estadistica(t_lsd, 1)
+        _nota(t_lsd, 2, "Letras de LSD (misma letra = no difieren):")
+        self._tree_letras_lsd = self._crear_tabla_estadistica(t_lsd, 3)
+
+    def _crear_tabla_estadistica(self, contenedor, fila: int, selectmode: str = "browse") -> ttk.Treeview:
+        marco = ctk.CTkFrame(contenedor, fg_color="transparent")
+        marco.grid(row=fila, column=0, sticky="nsew", padx=4, pady=2)
+        marco.grid_columnconfigure(0, weight=1)
+        marco.grid_rowconfigure(0, weight=1)
+        tree = ttk.Treeview(marco, columns=(), show="headings", style="BioGrow.Treeview", selectmode=selectmode)
+        vsb = ttk.Scrollbar(marco, orient="vertical", command=tree.yview, style="Dark.Vertical.TScrollbar")
+        hsb = ttk.Scrollbar(marco, orient="horizontal", command=tree.xview, style="Dark.Horizontal.TScrollbar")
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=(4, 0))
-        vsb.grid(row=0, column=1, sticky="ns", pady=(4, 0))
-        hsb.grid(row=1, column=0, sticky="ew", padx=(4, 0))
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._tablas_estadisticas = getattr(self, "_tablas_estadisticas", []) + [tree]
         return tree
 
-    def _poblar_treeview_df(self, tree: ttk.Treeview, df: pd.DataFrame, columnas: list) -> None:
-        for item in tree.get_children():
-            tree.delete(item)
-        if df is None or df.empty:
-            return
-        for idx, (_, row) in enumerate(df.iterrows()):
-            vals = []
-            for c in columnas:
-                v = row.get(c, "")
-                if pd.isna(v):
-                    vals.append("")
-                elif isinstance(v, (int, np.integer)):
-                    vals.append(str(int(v)))
-                elif isinstance(v, (float, np.floating)):
-                    vals.append(f"{v:.4f}" if "p" in c.lower() else f"{v:.3f}")
-                else:
-                    vals.append(str(v))
-            es_par = (idx % 2 == 1)
-            texto_fila = " ".join(vals)
-            if "✔" in texto_fila:
-                tag = "alt_si" if es_par else "germino_si"
-            elif "✘" in texto_fila:
-                tag = "alt_no" if es_par else "germino_no"
+    def _llenar_tabla(self, tree: ttk.Treeview, df: Optional[pd.DataFrame], dec: int = 3, ids=None) -> None:
+        tree.delete(*tree.get_children())
+        cols, filas = AN.formatear_tabla(df, dec)
+        tree["columns"] = cols
+        for i, c in enumerate(cols):
+            largo = max([len(c)] + [len(f[i]) for f in filas[:300]]) if filas else len(c)
+            tree.heading(c, text=c, anchor="center")
+            tree.column(c, width=min(max(70, int(largo * 7.4) + 18), 340), minwidth=55,
+                        anchor="w" if i == 0 or c in ("Grupo", "Grupo A", "Grupo B", "Caja", "Motivo") else "center",
+                        stretch=True)
+        for k, f in enumerate(filas):
+            texto = " ".join(f)
+            if "✔" in texto:
+                tag = "si"
+            elif "✘" in texto:
+                tag = "no"
             else:
-                tag = "row_alt" if es_par else "row_norm"
-            tree.insert("", "end", values=vals, tags=(tag,))
+                tag = "alt" if k % 2 else "norm"
+            iid = ids[k] if ids is not None else None
+            tree.insert("", "end", iid=iid, values=f, tags=(tag,))
 
-    def _ejecutar_analisis_ui(self) -> None:
-        df_activo = self._obtener_dataframe_activo()
-        variable = self._var_variable_calc.get()
-        agrupacion = self._var_agrupacion_calc.get()
-        por_caja = self._var_unidad_calc.get().startswith("Por Caja")
-        alfa = float(self._var_alfa_calc.get())
-        excluir_ng = self._var_excluir_nogerm.get()
-        excluir_at = self._var_excluir_atipicos.get()
+    def _estilizar_tablas_estadisticas(self) -> None:
+        p = TTK_PALETTES[self._modo_actual]
+        for tree in getattr(self, "_tablas_estadisticas", []):
+            tree.tag_configure("si", foreground=p["accent_green"], background=p["bg_card"])
+            tree.tag_configure("no", foreground=p["accent_red"], background=p["bg_card"])
+            tree.tag_configure("alt", background=p["row_alt"], foreground=p["text_primary"])
+            tree.tag_configure("norm", background=p["bg_card"], foreground=p["text_primary"])
 
-        df_sem, df_an = preparar_datos_analisis(
-            df_activo, variable, agrupacion,
-            excluir_no_germinadas=excluir_ng,
-            por_caja=por_caja,
-            excluir_atipicos=excluir_at,
-        )
-        res = ejecutar_suite_completa(df_sem, df_an, variable, alfa)
-        self._ultimo_resultado_stats = {
-            "df_activo": df_activo,
-            "df_sem": df_sem,
-            "df_an": df_an,
-            "variable": variable,
-            "agrupacion": agrupacion,
-            "por_caja": por_caja,
-            "alfa": alfa,
-            "res": res,
+    def _opciones_descartes(self) -> dict:
+        return {
+            "cajas_vacias": self._var_cajas_vacias.get(),
+            "no_germinadas": "excluir" if self._var_no_germ.get().startswith("Excluir") else "incluir",
+            "ceros_germinadas": self._var_ceros.get(),
+            "atipicos": self._var_excluir_atipicos.get(),
+            "factor_iqr": 1.5,
         }
 
-        unidad_txt = "cajas/lotes" if (por_caja or variable == "Germinó") else "semillas"
-        resumen_txt = generar_texto_conclusion(variable, agrupacion, unidad_txt, res, alfa)
-        self._txt_conclusion_anova.configure(state="normal")
-        self._txt_conclusion_anova.delete("1.0", tk.END)
-        self._txt_conclusion_anova.insert("1.0", resumen_txt)
-        self._txt_conclusion_anova.configure(state="disabled")
+    def _analizar(self, df: pd.DataFrame, filtros_extra: Optional[dict] = None) -> dict:
+        variedad = self._var_filtro_var_calc.get()
+        f = dict(variedades_sel=[variedad] if variedad and variedad != "Todas las variedades" else None)
+        f.update(filtros_extra or {})
+        datos = AN.filtrar(df, **f) if not df.empty else df
+        return AN.analizar(datos, self._var_variable_calc.get(), self._var_agrupacion_calc.get(),
+                           self._var_unidad_calc.get(), float(self._var_alfa_calc.get()),
+                           self._var_long_calc.get(), self._opciones_descartes())
 
-        self._poblar_treeview_df(
-            self._tree_ranking, res["ranking"],
-            ["Lugar", "Grupo", "n", "Promedio ± DE", "Varianza", "CV %", "% Germ.", "Tukey", "LSD"]
-        )
-        self._poblar_treeview_df(
-            self._tree_anova, res["anova"]["tabla"] if res["anova"] else pd.DataFrame(),
-            ["Fuente", "GL", "SC", "CM", "F calc", "F crít", "Comparación", "p-valor", "Conclusión"]
-        )
-        self._poblar_treeview_df(
-            self._tree_tukey, res["tukey"],
-            ["Grupo 1", "Grupo 2", "Conclusión", "|Diferencia|", "DHS", "Comparación", "q calc", "q crít", "p ajustada"]
-        )
-        self._poblar_treeview_df(
-            self._tree_lsd, res["lsd"],
-            ["Grupo 1", "Grupo 2", "Conclusión", "|Diferencia|", "LSD", "Comparación", "t calc", "t crít", "p-valor"]
-        )
-        self._poblar_treeview_df(
-            self._tree_cuartiles, res["cuartiles"],
-            ["Grupo", "n", "Mínimo", "Q1", "Mediana", "Q3", "Máximo", "IQR", "Lím. Inf", "Lím. Sup", "Atípicos", "Bowley", "Forma"]
-        )
+    def _ejecutar_analisis_ui(self) -> None:
+        if not hasattr(self, "_txt_conclusion_anova"):
+            return
+        self._estilizar_tablas_estadisticas()
+        try:
+            df = self._obtener_dataframe_activo()
+        except Exception as e:  # el análisis nunca debe impedir usar la pestaña de registro
+            df = pd.DataFrame()
+            messagebox.showerror("Error al leer los datos", str(e), parent=self)
+        self._df_activo = df
 
-        self._actualizar_kpis_tablero()
+        # Listas que dependen de los datos
+        vars_disp = ["Todas las variedades"] + AN.variedades(df)
+        self._cmb_variedad_calc.configure(values=vars_disp)
+        if self._var_filtro_var_calc.get() not in vars_disp:
+            self._var_filtro_var_calc.set("Todas las variedades")
+        if not self._unidad_tocada and not df.empty:
+            self._var_long_calc.set(AN.unidad_por_defecto(df))
+        self._actualizar_filtros_tablero(df)
+
+        try:
+            res = self._analizar(df)
+        except Exception as e:
+            res = {"ok": False, "mensaje": f"No se pudo hacer el análisis: {e}", "avisos": []}
+        self._ultimo_resultado_stats = res
+        self._mostrar_resultados_calculos(res)
         self._dibujar_grafica_tablero()
 
+    def _escribir(self, caja: ctk.CTkTextbox, texto: str) -> None:
+        caja.configure(state="normal")
+        caja.delete("1.0", tk.END)
+        caja.insert("1.0", texto)
+        caja.configure(state="disabled")
+
+    def _mostrar_resultados_calculos(self, res: dict) -> None:
+        tablas = [self._tree_ranking, self._tree_desc, self._tree_anova, self._tree_tukey, self._tree_letras_tukey,
+                  self._tree_lsd, self._tree_letras_lsd]
+        if res.get("forzar_semilla"):
+            self._var_unidad_calc.set("Por semilla")
+            self._cmb_unidad_calc.configure(state="disabled")
+        else:
+            self._cmb_unidad_calc.configure(state="disabled" if res.get("variable") == "Germinó" else "readonly")
+            if res.get("variable") == "Germinó":
+                self._var_unidad_calc.set("Por caja (promedio de sus semillas)")
+
+        if not res.get("ok"):
+            for t in tablas:
+                self._llenar_tabla(t, None)
+            self._escribir(self._txt_conclusion_anova, res.get("mensaje") or "Sin datos.")
+            self._escribir(self._txt_pares, "")
+            return
+
+        an, u, u2, alfa = res.get("anova"), res["u"], res["u2"], res["alfa"]
+        m = res["metricas"]
+        germ = m["% germinación global"]
+        cabecera = (f"{m['Semillas analizadas']:,} semillas · {m['Cajas']} cajas · {m['Grupos comparados']} grupos · "
+                    f"{list(m.values())[3]} datos ({res['unidad_txt']}) · germinación global "
+                    f"{'—' if pd.isna(germ) else f'{germ:.1f} %'} · {m['Registros descartados']} registros descartados · "
+                    f"comparando por {res['agrupacion'].lower()}")
+        if an:
+            dictamen = (("✔ Sí hay" if an["significativo"] else "✘ No hay") +
+                        f" diferencias significativas en {res['nombre_var'].lower()} entre los grupos "
+                        f"(F calculada = {an['F calculada']:.3f} {'>' if an['significativo'] else '≤'} "
+                        f"F crítica = {an['F crítica']:.3f}; GL = {an['GL entre']} y {an['GL error']}; "
+                        f"p = {an['p-valor']:.4f}; α = {alfa}).")
+        else:
+            dictamen = "Sin ANOVA."
+        self._escribir(self._txt_conclusion_anova, f"{dictamen}\n{cabecera}")
+
+        self._llenar_tabla(self._tree_ranking, res["ranking"], dec=2)
+        self._escribir(self._txt_pares, "\n".join(f"• {f.replace('**', '')}" for f in res["frases"]) if res["frases"]
+                       else "• Ningún par de grupos difiere según Tukey.")
+        self._llenar_tabla(self._tree_desc, res["tabla_descriptivos"])
+        self._llenar_tabla(self._tree_anova, res["tabla_anova"])
+        if an:
+            self._nota_anova.configure(text=(
+                f"¿Al menos un grupo tiene un promedio distinto? Si F calculada > F crítica (o p < α) sí. "
+                f"F crítica = F({1 - alfa:.2f}; {an['GL entre']}, {an['GL error']}) = {an['F crítica']:.3f}. "
+                f"GL entre grupos = k − 1 = {an['GL entre']}; GL del error = n − k = {an['GL error']}."))
+        tk_, ls_ = res["tukey"], res["lsd"]
+        if not tk_.empty:
+            self._nota_tukey.configure(text=(
+                f"Si |A − B| > DHS (o q calculada > q crítica), los dos grupos difieren. q crítica (α = {alfa}) = "
+                f"{tk_['q crítica'].iloc[0]:.3f} · k = {an['k']} grupos · GL del error = {an['GL error']} · "
+                f"CM del error = {an['CM error']:.3f} {u2}. DHS = q·√(CMe/2·(1/nA + 1/nB))."))
+            if not ls_.empty:
+                self._nota_lsd.configure(text=(
+                    f"Si |A − B| > LSD (o t calculada > t crítica), los dos grupos difieren. t crítica (α = {alfa}, "
+                    f"dos colas) = {ls_['t crítica'].iloc[0]:.3f} · GL del error = {an['GL error']}. "
+                    f"LSD = t·√(CMe·(1/nA + 1/nB)). LSD no corrige por hacer muchas comparaciones."
+                    + ("" if an["significativo"] else "  ⚠ El ANOVA no es significativo: no reportes estas diferencias.")))
+        else:
+            self._nota_tukey.configure(text="Se necesitan al menos 2 grupos con 2 o más datos.")
+            self._nota_lsd.configure(text="Se necesitan al menos 2 grupos con 2 o más datos.")
+        self._llenar_tabla(self._tree_tukey, res["tabla_tukey"])
+        self._llenar_tabla(self._tree_letras_tukey,
+                           res["letras_tukey"].rename(columns={"Media": f"Promedio ({u})"}) if an else None)
+        self._llenar_tabla(self._tree_lsd, res["tabla_lsd"])
+        self._llenar_tabla(self._tree_letras_lsd,
+                           res["letras_lsd"].rename(columns={"Media": f"Promedio ({u})"}) if an else None)
+
+    def _exportar_reporte_calculos(self) -> None:
+        res = self._ultimo_resultado_stats
+        if not res or not res.get("ok"):
+            messagebox.showwarning("Sin análisis", (res or {}).get("mensaje") or
+                                   "Todavía no hay un análisis para exportar.", parent=self)
+            return
+        var = res["variable"].replace("í", "i").replace("ó", "o")
+        ruta = filedialog.asksaveasfilename(
+            parent=self,
+            title="Guardar reporte de cálculos en PDF",
+            defaultextension=".pdf",
+            initialfile=f"Reporte_Calculos_{var}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            filetypes=[("Archivos PDF", "*.pdf")],
+        )
+        if not ruta:
+            return
+        op = self._opciones_descartes()
+        descartes = [("semillas no germinadas: " + ("excluidas del promedio" if op["no_germinadas"] == "excluir"
+                                                    else f"incluidas con 0 {res['unidad_long']}"))]
+        if op["ceros_germinadas"]:
+            descartes.append("germinadas con valor 0 excluidas")
+        if op["atipicos"]:
+            descartes.append("atípicos de cada grupo excluidos (1.5×IQR)")
+        if op["cajas_vacias"]:
+            descartes.append("cajas vacías excluidas")
+        config = {
+            "fuente": self._var_fuente_datos.get().replace("MySQL", "Base de datos"),
+            "archivos": ", ".join(os.path.basename(a) for a in self._archivos_excel_cargados)
+            if not self._var_fuente_datos.get().startswith("Solo MySQL") else "",
+            "variedad": self._var_filtro_var_calc.get(),
+            "descartes": "; ".join(descartes),
+        }
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            REP.generar_pdf(ruta, res, config, TTK_PALETTES["light"])
+            messagebox.showinfo("✅ Reporte generado", f"Reporte de cálculos guardado en:\n{ruta}", parent=self)
+        except ImportError:
+            messagebox.showerror("Librería faltante", "Instala reportlab ejecutando en tu terminal:\npip install reportlab",
+                                 parent=self)
+        except Exception as e:
+            messagebox.showerror("Error al exportar", f"No se pudo generar el reporte PDF:\n{e}", parent=self)
+        finally:
+            self.configure(cursor="")
+
     # -----------------------------------------------------------------------
-    # Página 3: Tablero y Gráficas Interactivas (Matplotlib + Letras Tukey/LSD)
+    # Página 3: Tablero y Gráficas (las gráficas del dashboard, en matplotlib)
     # -----------------------------------------------------------------------
 
     def _construir_seccion_tablero(self, padre: ctk.CTkFrame) -> None:
         padre.grid_columnconfigure((0, 1, 2, 3), weight=1)
         padre.grid_rowconfigure(2, weight=1)
+        redibujar = lambda *_: self._dibujar_grafica_tablero()
 
-        # Marco Principal de Controles del Gráfico
-        ctrl_graf = ctk.CTkFrame(
-            padre, fg_color=UI_COLORS["bg_card"],
-            corner_radius=10, border_width=1, border_color=UI_COLORS["border"]
-        )
+        ctrl_graf = ctk.CTkFrame(padre, fg_color=UI_COLORS["bg_card"], corner_radius=10,
+                                 border_width=1, border_color=UI_COLORS["border"])
         ctrl_graf.grid(row=0, column=0, columnspan=4, pady=(0, 8), sticky="ew")
 
-        # --- FILA 1: Tipo de Gráfica, Letras, Barras de Error y Botón Guardar ---
         fila1 = ctk.CTkFrame(ctrl_graf, fg_color="transparent")
         fila1.pack(fill="x", padx=10, pady=(10, 4))
-
-        ctk.CTkLabel(
-            fila1, text="📊 Tipo de Gráfica:",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color=UI_COLORS["text_primary"],
-        ).pack(side="left", padx=(6, 6))
-
-        self._var_tipo_grafica = tk.StringVar(value="1. Barras: Promedio + Letras + Patrón")
-        ctk.CTkComboBox(
-            fila1,
-            variable=self._var_tipo_grafica,
-            values=[
-                "1. Barras: Promedio + Letras + Patrón",
-                "2. Cajas (Boxplot): Distribución + Letras",
-                "3. Tukey Cluster: Intervalos Simultáneos (DHS)",
-                "4. LSD de Fisher: ¿Qué pares superan la LSD?",
-                "5. Dispersión: Datos alrededor de su Promedio (±1 DE)",
-                "6. Comparativa: Raíz vs Tallo por Grupo",
-                "7. Germinación: Germinaron vs No Germinaron (%)",
-                "8. Correlación Alométrica: Raíz vs Tallo (OLS)",
-            ],
-            width=290,
-            state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero(),
-        ).pack(side="left", padx=6)
-
-        ctk.CTkLabel(
-            fila1, text="Letras:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(10, 4))
-
+        ctk.CTkLabel(fila1, text="📊 Tipo de Gráfica:", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                     text_color=UI_COLORS["text_primary"]).pack(side="left", padx=(6, 6))
+        self._var_tipo_grafica = tk.StringVar(value=GR.TIPOS[0])
+        ctk.CTkComboBox(fila1, variable=self._var_tipo_grafica, values=GR.TIPOS, width=330, state="readonly",
+                        command=redibujar).pack(side="left", padx=6)
+        self._etiqueta_control(fila1, "  Letras:")
         self._var_letras_graf = tk.StringVar(value="Tukey")
-        ctk.CTkSegmentedButton(
-            fila1, values=["Tukey", "LSD"], variable=self._var_letras_graf,
-            width=110, command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
-
-        ctk.CTkLabel(
-            fila1, text="Barras de error:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(10, 4))
-
+        ctk.CTkSegmentedButton(fila1, values=["Tukey", "LSD"], variable=self._var_letras_graf, width=110,
+                               command=redibujar).pack(side="left", padx=4)
+        self._etiqueta_control(fila1, "  Barras de error:")
         self._var_error_graf = tk.StringVar(value="Desviación estándar")
-        ctk.CTkComboBox(
-            fila1, variable=self._var_error_graf,
-            values=["Desviación estándar", "Error estándar (SEM)", "IC 95%"],
-            width=150, state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
+        ctk.CTkComboBox(fila1, variable=self._var_error_graf,
+                        values=["Desviación estándar", "Error estándar (SEM)", "IC 95%"], width=170,
+                        state="readonly", command=redibujar).pack(side="left", padx=4)
+        ctk.CTkButton(fila1, text="💾 Guardar Gráfica (PNG/PDF)", width=170, fg_color=UI_COLORS["accent_green"],
+                      hover_color=UI_COLORS["accent_hover"], text_color="#ffffff",
+                      font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._guardar_grafica_archivo).pack(side="right", padx=6)
 
-        ctk.CTkButton(
-            fila1, text="💾 Guardar Gráfica (PNG/PDF)",
-            width=170, fg_color=UI_COLORS["accent_green"], hover_color=UI_COLORS["accent_hover"],
-            text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
-            command=self._guardar_grafica_archivo,
-        ).pack(side="right", padx=6)
-
-        # --- FILA 2: Filtros Rápidos Locales (Variedad, Tratamiento, Desde y Hasta) ---
+        # Filtros rápidos: se suman a los de 'Cálculos y Modelos' (variable, comparación y descartes)
         fila2 = ctk.CTkFrame(ctrl_graf, fg_color="transparent")
         fila2.pack(fill="x", padx=10, pady=(4, 10))
-
-        ctk.CTkLabel(
-            fila2, text="🔍 Variedad:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(6, 2))
-
-        lista_vars = ["Todas las variedades"]
-        try:
-            df_temp = self._obtener_df_activo() if hasattr(self, "_obtener_df_activo") else pd.DataFrame()
-            if not df_temp.empty:
-                col_v = "Tipo Semilla" if "Tipo Semilla" in df_temp.columns else ("Variedad de Semilla" if "Variedad de Semilla" in df_temp.columns else None)
-                if col_v:
-                    lista_vars += sorted(df_temp[col_v].dropna().unique().tolist())
-        except Exception:
-            pass
-        if len(lista_vars) == 1:
-            lista_vars += ["Semilla de maíz blanco", "Semilla de maíz rosa", "Semilla de maíz cacahuazintle", "Semilla de lenteja"]
-
+        self._etiqueta_control(fila2, "🔍 Variedad:")
         self._var_filtro_var_tablero = tk.StringVar(value="Todas las variedades")
-        ctk.CTkComboBox(
-            fila2, variable=self._var_filtro_var_tablero,
-            values=lista_vars, width=170, state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
-
-        ctk.CTkLabel(
-            fila2, text="Tratamiento:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(8, 2))
-
+        self._cmb_var_tablero = ctk.CTkComboBox(fila2, variable=self._var_filtro_var_tablero,
+                                                values=["Todas las variedades"], width=190, state="readonly",
+                                                command=redibujar)
+        self._cmb_var_tablero.pack(side="left", padx=(0, 10))
+        self._etiqueta_control(fila2, "Tratamiento:")
         self._var_filtro_trat_tablero = tk.StringVar(value="Todos los tratamientos")
-        ctk.CTkComboBox(
-            fila2, variable=self._var_filtro_trat_tablero,
-            values=["Todos los tratamientos", "Control", "30s", "45s", "60s"], width=130, state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
-
-        # Fechas únicas disponibles
-        lista_fechas = []
-        try:
-            if not df_temp.empty and "fecha_registro" in df_temp.columns:
-                fechas_unicas = pd.to_datetime(df_temp["fecha_registro"], errors="coerce").dt.strftime("%Y-%m-%d").dropna().unique().tolist()
-                lista_fechas = sorted(list(set(fechas_unicas)))
-        except Exception:
-            pass
-
-        ctk.CTkLabel(
-            fila2, text="📅 Desde:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(8, 2))
-
+        self._cmb_trat_tablero = ctk.CTkComboBox(fila2, variable=self._var_filtro_trat_tablero,
+                                                 values=["Todos los tratamientos"], width=170, state="readonly",
+                                                 command=redibujar)
+        self._cmb_trat_tablero.pack(side="left", padx=(0, 10))
+        self._etiqueta_control(fila2, "📅 Desde:")
         self._var_fecha_desde = tk.StringVar(value="Todas")
-        ctk.CTkComboBox(
-            fila2, variable=self._var_fecha_desde,
-            values=["Todas"] + lista_fechas, width=115, state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
-
-        ctk.CTkLabel(
-            fila2, text="Hasta:",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(side="left", padx=(6, 2))
-
+        self._cmb_desde = ctk.CTkComboBox(fila2, variable=self._var_fecha_desde, values=["Todas"], width=115,
+                                          state="readonly", command=redibujar)
+        self._cmb_desde.pack(side="left", padx=(0, 6))
+        self._etiqueta_control(fila2, "Hasta:")
         self._var_fecha_hasta = tk.StringVar(value="Todas")
-        ctk.CTkComboBox(
-            fila2, variable=self._var_fecha_hasta,
-            values=["Todas"] + lista_fechas, width=115, state="readonly",
-            command=lambda _: self._dibujar_grafica_tablero()
-        ).pack(side="left", padx=4)
+        self._cmb_hasta = ctk.CTkComboBox(fila2, variable=self._var_fecha_hasta, values=["Todas"], width=115,
+                                          state="readonly", command=redibujar)
+        self._cmb_hasta.pack(side="left", padx=(0, 10))
+        self._lbl_info_tablero = ctk.CTkLabel(fila2, text="", font=ctk.CTkFont(size=11),
+                                              text_color=UI_COLORS["text_secondary"])
+        self._lbl_info_tablero.pack(side="left", padx=(6, 0))
 
-        # 4 Tarjetas KPI
-        self._lbl_kpi_total = self._crear_kpi_card(padre, 1, 0, "🌱 Semillas Activas", "0", UI_COLORS["accent_indigo"])
-        self._lbl_kpi_germ  = self._crear_kpi_card(padre, 1, 1, "✓ Germinación Global", "0 (0%)", UI_COLORS["accent_green"])
+        self._lbl_kpi_total = self._crear_kpi_card(padre, 1, 0, "🌱 Semillas Analizadas", "0", UI_COLORS["accent_indigo"])
+        self._lbl_kpi_germ = self._crear_kpi_card(padre, 1, 1, "✓ Germinación Global", "0 (0%)", UI_COLORS["accent_green"])
         self._lbl_kpi_lotes = self._crear_kpi_card(padre, 1, 2, "📦 Cajas / Lotes", "0", UI_COLORS["accent_amber"])
-        self._lbl_kpi_fval  = self._crear_kpi_card(padre, 1, 3, "🧮 ANOVA (F / p-valor)", "—", UI_COLORS["accent_red"])
+        self._lbl_kpi_fval = self._crear_kpi_card(padre, 1, 3, "🧮 ANOVA (F / p-valor)", "—", UI_COLORS["accent_red"])
 
-        # Contenedor del Lienzo Matplotlib
-        self._chart_container = ctk.CTkFrame(
-            padre, fg_color=UI_COLORS["bg_card"],
-            corner_radius=12, border_width=1, border_color=UI_COLORS["border"]
-        )
+        self._chart_container = ctk.CTkFrame(padre, fg_color=UI_COLORS["bg_card"], corner_radius=12,
+                                             border_width=1, border_color=UI_COLORS["border"])
         self._chart_container.grid(row=2, column=0, columnspan=4, pady=(8, 0), sticky="nsew")
         self._chart_container.grid_columnconfigure(0, weight=1)
-        self._chart_container.grid_rowconfigure(0, weight=1)
-
+        self._chart_container.grid_rowconfigure(1, weight=1)
         self._canvas_widget = None
 
     def _crear_kpi_card(self, padre, row: int, col: int, titulo: str, valor: str, color_borde) -> ctk.CTkLabel:
         padx = (0, 6) if col == 0 else ((6, 6) if col in (1, 2) else (6, 0))
-        card = ctk.CTkFrame(
-            padre, fg_color=UI_COLORS["bg_card"],
-            corner_radius=10, border_width=2, border_color=color_borde
-        )
+        card = ctk.CTkFrame(padre, fg_color=UI_COLORS["bg_card"], corner_radius=10, border_width=2,
+                            border_color=color_borde)
         card.grid(row=row, column=col, padx=padx, pady=4, sticky="nsew")
-
-        ctk.CTkLabel(
-            card, text=titulo,
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=UI_COLORS["text_secondary"],
-        ).pack(anchor="w", padx=14, pady=(10, 2))
-
-        lbl_val = ctk.CTkLabel(
-            card, text=valor,
-            font=ctk.CTkFont(family="Segoe UI", size=19, weight="bold"),
-            text_color=UI_COLORS["text_primary"],
-        )
+        ctk.CTkLabel(card, text=titulo, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                     text_color=UI_COLORS["text_secondary"]).pack(anchor="w", padx=14, pady=(10, 2))
+        lbl_val = ctk.CTkLabel(card, text=valor, font=ctk.CTkFont(family="Segoe UI", size=19, weight="bold"),
+                               text_color=UI_COLORS["text_primary"])
         lbl_val.pack(anchor="w", padx=14, pady=(0, 10))
         return lbl_val
 
-    def _actualizar_kpis_tablero(self) -> None:
-        if not self._ultimo_resultado_stats or self._ultimo_resultado_stats["df_activo"].empty:
-            stats_db = self.db.contar_registros()
-            total = stats_db.get("total", 0)
-            germ = stats_db.get("germinadas", 0)
-            lotes = stats_db.get("lotes", 0)
-            pct = round((germ / total * 100), 1) if total > 0 else 0.0
-            self._lbl_kpi_total.configure(text=str(total))
-            self._lbl_kpi_germ.configure(text=f"{germ} ({pct}%)")
-            self._lbl_kpi_lotes.configure(text=str(lotes))
+    def _actualizar_filtros_tablero(self, df: pd.DataFrame) -> None:
+        if not hasattr(self, "_cmb_var_tablero"):
+            return
+        for cmb, var, todos, valores in [
+            (self._cmb_var_tablero, self._var_filtro_var_tablero, "Todas las variedades", AN.variedades(df)),
+            (self._cmb_trat_tablero, self._var_filtro_trat_tablero, "Todos los tratamientos", AN.tratamientos(df)),
+            (self._cmb_desde, self._var_fecha_desde, "Todas", AN.fechas(df)),
+            (self._cmb_hasta, self._var_fecha_hasta, "Todas", AN.fechas(df)),
+        ]:
+            opciones = [todos] + valores
+            cmb.configure(values=opciones)
+            if var.get() not in opciones:
+                var.set(todos)
+
+    def _filtros_tablero(self) -> dict:
+        f = {}
+        v = self._var_filtro_var_tablero.get()
+        if v and v != "Todas las variedades":
+            f["variedades_sel"] = [v]
+        t = self._var_filtro_trat_tablero.get()
+        if t and t != "Todos los tratamientos":
+            f["tratamiento"] = t
+        if self._var_fecha_desde.get() not in ("", "Todas"):
+            f["desde"] = self._var_fecha_desde.get()
+        if self._var_fecha_hasta.get() not in ("", "Todas"):
+            f["hasta"] = self._var_fecha_hasta.get()
+        return f
+
+    def _actualizar_kpis_tablero(self, res: Optional[dict] = None) -> None:
+        res = res if res is not None else self._ultimo_resultado_stats
+        if not res or "metricas" not in res:
+            for lbl in (self._lbl_kpi_total, self._lbl_kpi_germ, self._lbl_kpi_lotes):
+                lbl.configure(text="0")
             self._lbl_kpi_fval.configure(text="Sin datos")
             return
-
-        df_sem = self._ultimo_resultado_stats["df_sem"]
-        anova = self._ultimo_resultado_stats["res"].get("anova")
-        total = len(df_sem)
-        germ = int((df_sem["Germinó"] == 1).sum()) if "Germinó" in df_sem.columns else 0
-        cajas = df_sem["Corrida"].nunique() if "Corrida" in df_sem.columns else 0
-        pct = (germ / total * 100) if total > 0 else 0.0
-
-        self._lbl_kpi_total.configure(text=f"{total:,}")
-        self._lbl_kpi_germ.configure(text=f"{germ:,} ({pct:.1f}%)")
-        self._lbl_kpi_lotes.configure(text=f"{cajas:,}")
-        if anova:
-            estado = "✔ Sig." if anova["significativo"] else "✘ No sig."
-            self._lbl_kpi_fval.configure(text=f"F={anova['F calculada']:.2f} (p={anova['p-valor']:.3g}) {estado}")
+        m = res["metricas"]
+        d = res["df_semilla"]
+        col = "Germinó (conteo)" if "Germinó (conteo)" in d.columns else "Germinó"
+        germ = int((pd.to_numeric(d[col], errors="coerce") == 1).sum()) if not d.empty else 0
+        pct = m["% germinación global"]
+        self._lbl_kpi_total.configure(text=f"{m['Semillas analizadas']:,}")
+        self._lbl_kpi_germ.configure(text=f"{germ:,} ({0 if pd.isna(pct) else pct:.1f}%)")
+        self._lbl_kpi_lotes.configure(text=f"{m['Cajas']:,}")
+        an = res.get("anova")
+        if an:
+            estado = "✔ Sig." if an["significativo"] else "✘ No sig."
+            self._lbl_kpi_fval.configure(text=f"F={an['F calculada']:.2f} (p={an['p-valor']:.3g}) {estado}")
         else:
             self._lbl_kpi_fval.configure(text="Insuf. grupos")
 
     def _dibujar_grafica_tablero(self) -> None:
-        if not hasattr(self, "_chart_container"):
+        if not hasattr(self, "_chart_container") or not hasattr(self, "_df_activo"):
             return
-
-        # 1. Obtener DataFrame base activo
-        df_base = self._obtener_df_activo() if hasattr(self, "_obtener_df_activo") else pd.DataFrame()
-        if df_base.empty and self._ultimo_resultado_stats:
-            df_base = self._ultimo_resultado_stats.get("df_an", pd.DataFrame())
-
-        # 2. Filtrar localmente por Variedad
-        if hasattr(self, "_var_filtro_var_tablero"):
-            v_sel = self._var_filtro_var_tablero.get()
-            if v_sel and v_sel != "Todas las variedades":
-                col_v = "Tipo Semilla" if "Tipo Semilla" in df_base.columns else "Variedad de Semilla"
-                if col_v in df_base.columns:
-                    df_base = df_base[df_base[col_v] == v_sel]
-
-        # 3. Filtrar localmente por Tratamiento
-        if hasattr(self, "_var_filtro_trat_tablero"):
-            t_sel = self._var_filtro_trat_tablero.get()
-            if t_sel and t_sel != "Todos los tratamientos":
-                if "Tratamiento" in df_base.columns:
-                    df_base = df_base[df_base["Tratamiento"] == t_sel]
-
-        # 4. Filtrar localmente por Rango de Fechas (Desde / Hasta)
-        if hasattr(self, "_var_fecha_desde") and hasattr(self, "_var_fecha_hasta") and "fecha_registro" in df_base.columns:
-            f_desde = self._var_fecha_desde.get()
-            f_hasta = self._var_fecha_hasta.get()
-            
-            fechas_dt = pd.to_datetime(df_base["fecha_registro"], errors="coerce")
-            if f_desde and f_desde != "Todas":
-                df_base = df_base[fechas_dt >= pd.to_datetime(f_desde)]
-            if f_hasta and f_hasta != "Todas":
-                df_base = df_base[fechas_dt <= pd.to_datetime(f_hasta)]
-
-        # 5. Análisis estadístico flexible (permite 1 o más grupos)
-        variable = self._var_variable.get() if hasattr(self, "_var_variable") else "Raíz"
-        agrupacion = self._var_agrupacion.get() if hasattr(self, "_var_agrupacion") else "Tratamiento"
-        
-        try:
-            from analytics_engine import preparar_datos_analisis, ejecutar_suite_completa
-            df_sem_f, df_an_f = preparar_datos_analisis(
-                df_base, variable, agrupacion, 
-                replicas_modo="caja", excluir_atipicos=False
-            )
-            res_f = ejecutar_suite_completa(df_sem_f, df_an_f, variable, 0.05)
-            
-            # Actualizar KPIs en tiempo real
-            total_sem = len(df_base)
-            germ_glob = int((df_base["Estado"] == "Germinó").sum()) if "Estado" in df_base.columns else 0
-            pct_germ = (germ_glob / total_sem * 100) if total_sem > 0 else 0.0
-            
-            if hasattr(self, "_lbl_kpi_total"):
-                self._lbl_kpi_total.configure(text=str(total_sem))
-            if hasattr(self, "_lbl_kpi_germ"):
-                self._lbl_kpi_germ.configure(text=f"{germ_glob} ({pct_germ:.1f}%)")
-            if hasattr(self, "_lbl_kpi_lotes"):
-                cajas_n = df_base["Lote Origen"].nunique() if "Lote Origen" in df_base.columns else 1
-                self._lbl_kpi_lotes.configure(text=str(cajas_n))
-            if hasattr(self, "_lbl_kpi_fval") and res_f.get("anova"):
-                an_res = res_f["anova"]
-                self._lbl_kpi_fval.configure(text=f"F={an_res['F calculada']:.2f} (p={an_res['p-valor']:.3f})")
-            elif hasattr(self, "_lbl_kpi_fval"):
-                self._lbl_kpi_fval.configure(text="1 grupo (N/A)")
-
-        except Exception:
-            datos_st = self._ultimo_resultado_stats
-            if not datos_st:
-                return
-            df_an_f = datos_st["df_an"]
-            res_f = datos_st["res"]
+        filtros = self._filtros_tablero()
+        if filtros:
+            try:
+                res = self._analizar(self._df_activo, filtros)
+            except Exception as e:
+                res = {"ok": False, "mensaje": f"No se pudo hacer el análisis: {e}"}
+            self._lbl_info_tablero.configure(text="Filtros del tablero activos (se suman a los de Cálculos y Modelos).")
+        else:
+            res = self._ultimo_resultado_stats or {"ok": False, "mensaje": "Sin datos."}
+            self._lbl_info_tablero.configure(text="Misma variable, comparación y descartes de 'Cálculos y Modelos'.")
+        self._actualizar_kpis_tablero(res)
 
         for child in self._chart_container.winfo_children():
             child.destroy()
-
         p = TTK_PALETTES[self._modo_actual]
-        paleta = ["#2a78d6", "#10b981", "#f59e0b", "#6366f1", "#ec4899", "#14b8a6", "#f97316", "#8b5cf6"]
+        try:
+            fig = GR.dibujar(self._var_tipo_grafica.get(), res, p, self._var_letras_graf.get(),
+                             self._var_error_graf.get())
+        except Exception as e:
+            fig = GR._mensaje(p, f"No se pudo dibujar esta gráfica: {e}")
+        self._fig_actual = fig
 
-        # 4. Alta resolución (DPI 130) y espacio inferior amplio para nombres largos
-        fig = Figure(figsize=(10.5, 5.2), dpi=130, facecolor=p["bg_card"])
-        fig.subplots_adjust(bottom=0.32, left=0.10, right=0.95, top=0.90)
-        
-        ax = fig.add_subplot(111)
-        ax.set_facecolor(p["bg_card"])
-        for spine in ax.spines.values():
-            spine.set_color(p["border"])
-        ax.tick_params(colors=p["text_primary"], labelsize=9)
-        ax.xaxis.label.set_color(p["text_primary"])
-        ax.yaxis.label.set_color(p["text_primary"])
-        ax.title.set_color(p["text_primary"])
-        ax.grid(True, linestyle="--", alpha=0.22, color=p["text_muted"])
-
-        # Limpiar valores nulos o 'nan' en el grupo
-        df_an = df_an_f.copy()
-        if not df_an.empty and "Grupo" in df_an.columns:
-            df_an["Grupo"] = df_an["Grupo"].fillna("Sin especificar").astype(str)
-            df_an = df_an[df_an["Grupo"] != "nan"]
-
-        res = res_f
-        desc = res["descriptivos"]
-        if not desc.empty:
-            desc["Grupo"] = desc["Grupo"].fillna("Sin especificar").astype(str)
-            desc = desc[desc["Grupo"] != "nan"]
-
-        anova = res["anova"]
-        tipo_g = self._var_tipo_grafica.get()
-        usar_tukey = self._var_letras_graf.get() == "Tukey"
-        letras_df = res["letras_tukey"] if usar_tukey else res["letras_lsd"]
-        
-        mapa_letras = {}
-        if not letras_df.empty and "Grupo" in letras_df.columns:
-            mapa_letras = dict(zip(letras_df["Grupo"].astype(str), letras_df["Letras"]))
-
-        u = "%" if variable == "Germinó" else ("hojas" if variable == "Hojas" else "mm")
-
-        if df_an.empty or desc.empty or len(desc) < 1:
-            ax.text(0.5, 0.5, "No hay datos suficientes para mostrar con los filtros actualizados.\nSelecciona otra opción en 'Comparar por' o 'Filtrar Variedad'.",
-                    ha="center", va="center", color=p["text_secondary"], fontsize=11, transform=ax.transAxes)
-        elif tipo_g.startswith("1."):
-            # Gráfica 1: Barras con medias, errores y letras
-            d = desc.sort_values("Media", ascending=False).reset_index(drop=True)
-            err_mode = self._var_error_graf.get()
-            if err_mode == "Error estándar (SEM)":
-                err = d["SEM"].fillna(0).values
-            elif err_mode == "IC 95%":
-                err = (d["IC sup"] - d["Media"]).fillna(0).values
-            else:
-                err = d["Desviación estándar"].fillna(0).values
-
-            colores = ["#8a8984" if ("control" in g.lower() or "patrón" in g.lower()) else paleta[i % len(paleta)]
-                       for i, g in enumerate(d["Grupo"])]
-            x_pos = np.arange(len(d))
-            bars = ax.bar(x_pos, d["Media"], yerr=err, capsize=5, color=colores, edgecolor=p["border"], alpha=0.9)
-            
-            ax.set_xticks(x_pos)
-            ax.set_xticklabels(d["Grupo"], rotation=30, ha="right", fontsize=8.5)
-            ax.set_ylabel(f"{variable} promedio ({u})")
-
-            tope = float((d["Media"] + err).max()) if len(d) else 1.0
-            for idx, (bar, (_, row)) in enumerate(zip(bars, d.iterrows())):
-                let = mapa_letras.get(str(row["Grupo"]), "")
-                y_top = row["Media"] + err[idx]
-                ax.text(bar.get_x() + bar.get_width() / 2, y_top + tope * 0.03,
-                        f"{row['Media']:.1f} {let}".strip(), ha="center", va="bottom",
-                        fontsize=8.5, fontweight="bold", color=p["text_primary"])
-
-            ctrl_rows = d[d["Grupo"].str.lower().str.contains("control|patrón|patron")]
-            if not ctrl_rows.empty:
-                val_ctrl = float(ctrl_rows["Media"].iloc[0])
-                ax.axhline(val_ctrl, color="#f59e0b", linestyle="--", linewidth=1.8, label=f"Control: {val_ctrl:.2f} {u}")
-                ax.legend(facecolor=p["bg_secondary"], edgecolor=p["border"], labelcolor=p["text_primary"])
-
-            ax.set_ylim(0, tope * 1.25 if tope > 0 else 1)
-            sub_anova = f"F={anova['F calculada']:.2f}, p={anova['p-valor']:.4f}" if anova else "Sin ANOVA"
-            ax.set_title(f"{variable} por {agrupacion} — Letras de {self._var_letras_graf.get()} ({sub_anova})", fontweight="bold", fontsize=11)
-
-        elif tipo_g.startswith("2."):
-            # Gráfica 2: Boxplot (Distribución)
-            grupos = [g_vals["Valor"].values for _, g_vals in df_an.groupby("Grupo")]
-            nombres = [g_name for g_name, _ in df_an.groupby("Grupo")]
-            
-            bp = ax.boxplot(grupos, labels=nombres, patch_artist=True, medianprops=dict(color="white", linewidth=2))
-            for i, patch in enumerate(bp["boxes"]):
-                patch.set(facecolor=paleta[i % len(paleta)], edgecolor=p["border"], alpha=0.85)
-
-            ax.set_xticklabels(nombres, rotation=30, ha="right", fontsize=8.5)
-            ax.set_ylabel(f"{variable} ({u})")
-            ax.set_title(f"Distribución (Boxplot) de {variable} por {agrupacion}", fontweight="bold", fontsize=11)
-
-        elif tipo_g.startswith("3."):
-            # Gráfica 3: Violín
-            try:
-                grupos = [g_vals["Valor"].values for _, g_vals in df_an.groupby("Grupo")]
-                nombres = [g_name for g_name, _ in df_an.groupby("Grupo")]
-                parts = ax.violinplot(grupos, showmeans=True, showextrema=True, showmedians=True)
-                for i, pc in enumerate(parts['bodies']):
-                    pc.set_facecolor(paleta[i % len(paleta)])
-                    pc.set_edgecolor(p["border"])
-                    pc.set_alpha(0.8)
-
-                ax.set_xticks(np.arange(1, len(nombres) + 1))
-                ax.set_xticklabels(nombres, rotation=30, ha="right", fontsize=8.5)
-                ax.set_ylabel(f"{variable} ({u})")
-                ax.set_title(f"Diagrama de Violín — {variable} por {agrupacion}", fontweight="bold", fontsize=11)
-            except Exception:
-                ax.text(0.5, 0.5, "No hay suficientes datos para generar el diagrama de violín.", ha="center", va="center", color=p["text_secondary"])
-
+        alto_px = int(fig.get_figheight() * fig.dpi)
+        if alto_px > 620:  # gráficas con muchos pares: se desplazan verticalmente
+            contenedor = ctk.CTkScrollableFrame(self._chart_container, fg_color=p["bg_card"])
+            contenedor.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+            contenedor.grid_columnconfigure(0, weight=1)
+            canvas = FigureCanvasTkAgg(fig, master=contenedor)
+            canvas.get_tk_widget().configure(height=alto_px)
+            canvas.get_tk_widget().grid(row=0, column=0, sticky="ew")
         else:
-            # Gráfica 4: Germinación apilada / comparativa
-            if "Germinó" in res.get("columnas_disponibles", []):
-                germ_tab = df_an.groupby("Grupo")["Valor"].agg(
-                    Total="count",
-                    Germinadas=lambda x: (x == 1).sum()
-                ).reset_index()
-                germ_tab["No germinadas"] = germ_tab["Total"] - germ_tab["Germinadas"]
-                
-                x_pos = np.arange(len(germ_tab))
-                b1 = ax.bar(x_pos, germ_tab["Germinadas"], label="Germinadas", color="#10b981", edgecolor=p["border"], alpha=0.9)
-                b2 = ax.bar(x_pos, germ_tab["No germinadas"], bottom=germ_tab["Germinadas"], label="No germinadas", color="#ef4444", edgecolor=p["border"], alpha=0.9)
-
-                ax.set_xticks(x_pos)
-                ax.set_xticklabels(germ_tab["Grupo"], rotation=30, ha="right", fontsize=8.5)
-                ax.set_ylabel("Cantidad de semillas")
-                ax.legend(facecolor=p["bg_secondary"], edgecolor=p["border"], labelcolor=p["text_primary"])
-                ax.set_title(f"Conteo de Germinación por {agrupacion}", fontweight="bold", fontsize=11)
-            else:
-                ax.text(0.5, 0.5, "Gráfica no disponible para la métrica seleccionada.", ha="center", va="center", color=p["text_secondary"])
-
-        canvas = FigureCanvasTkAgg(fig, master=self._chart_container)
+            canvas = FigureCanvasTkAgg(fig, master=self._chart_container)
+            canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+        texto = GR.descripcion_cuartiles(res) if (self._var_tipo_grafica.get().startswith("9") and res.get("ok")) else ""
+        if texto:
+            caja = ctk.CTkTextbox(self._chart_container, height=118, fg_color=UI_COLORS["bg_secondary"],
+                                  text_color=UI_COLORS["text_primary"], wrap="word",
+                                  font=ctk.CTkFont(family="Segoe UI", size=11))
+            caja.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+            caja.insert("1.0", "Descripción de los datos\n" + texto)
+            caja.tag_add("titulo", "1.0", "1.end")
+            caja.configure(state="disabled")
+        barra = ctk.CTkFrame(self._chart_container, fg_color="transparent")
+        barra.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
+        toolbar = NavigationToolbar2Tk(canvas, barra, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left")
+        self._canvas_widget = canvas
 
     def _guardar_grafica_archivo(self) -> None:
         if self._fig_actual is None:
@@ -2766,5 +2601,5 @@ class BioGrowApp(ctk.CTk):
             filetypes=[("Imagen PNG (Alta resolución)", "*.png"), ("Documento PDF", "*.pdf"), ("Imagen JPG", "*.jpg")],
         )
         if ruta:
-            self._fig_actual.savefig(ruta, dpi=300, bbox_inches="tight")
+            self._fig_actual.savefig(ruta, dpi=300, bbox_inches="tight", facecolor=self._fig_actual.get_facecolor())
             messagebox.showinfo("✅ Gráfica Guardada", f"Gráfica exportada en alta resolución (300 DPI):\n{ruta}", parent=self)

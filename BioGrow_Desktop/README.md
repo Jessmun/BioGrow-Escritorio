@@ -235,3 +235,22 @@ El ejecutable se genera en `dist/BioGrow_Analytics.exe`.
 
 - `experimentos.db` (en esta carpeta y en la raíz del proyecto): base SQLite de la versión anterior. Se conserva como respaldo; la aplicación actual **no** la utiliza.
 - La versión web original (Flask: `app.py`, `templates/`, `styles/` en la raíz del proyecto) no forma parte de la aplicación de escritorio.
+
+---
+
+## Cálculos y Modelos / Tablero & Gráficas (análisis del dashboard)
+
+Las pestañas 2 y 3 hacen **los mismos cálculos que el dashboard de Streamlit (`dashboardst.py`)**:
+
+| Archivo | Qué hace |
+|---|---|
+| `motor_biogrow.py` | Copia fiel de las funciones de cálculo de `dashboardst.py` (lector de Excel, descartes, promedio por caja, descriptivos, ANOVA, Tukey, LSD, letras, cuartiles). Generado con `generar_motor.py`; no se edita a mano. |
+| `analisis_biogrow.py` | Convierte los registros de la base (pestaña 1) al mismo formato que los Excel y ejecuta el flujo de análisis del dashboard. |
+| `graficas_biogrow.py` | Las 9 gráficas del tablero (matplotlib), incluida la de cuartiles con su descripción de los datos. |
+| `reporte_biogrow.py` | Reporte PDF de los cálculos (botón «📄 Reporte PDF de los cálculos» en Cálculos y Modelos). |
+| `generar_motor.py` | Regenera `motor_biogrow.py` si cambia un cálculo en `dashboardst.py`: `python generar_motor.py ruta/a/dashboardst.py motor_biogrow.py` |
+
+- **Fuente de datos:** la base de datos (lo registrado en la pestaña 1), los Excel cargados, o ambos. Los Excel se leen con el lector del dashboard (todos sus formatos, incluido el exportado por esta app).
+- **Cálculos y Modelos:** variable (raíz, tallo, germinación), comparar por, variedad, cada dato es caja o semilla (si cada grupo tiene una sola caja se usa la semilla automáticamente), unidad mm/cm, α 5 % o 1 % y descartes. Arriba, el dictamen del ANOVA y el resumen de los datos. Sub-pestañas: Resumen, Promedio/DE/varianza, ANOVA, Tukey y LSD. El botón **📄 Reporte PDF de los cálculos** genera un PDF breve: dictamen del ANOVA, ranking con letras y gráfica de promedios, promedio/DE/varianza, tabla ANOVA, y Tukey y LSD (valor crítico, GL, letras y comparaciones).
+- **Tablero & Gráficas:** KPIs y las gráficas con letras de Tukey o LSD, más la gráfica de cuartiles (Q1, mediana, Q3, IQR y atípicos) con una descripción de los datos; usan la misma configuración de Cálculos y Modelos, más los filtros rápidos de variedad, tratamiento y fechas. La barra de herramientas permite zoom y desplazamiento, y la gráfica se guarda en PNG/PDF a 300 DPI.
+- `analytics_engine.py` ya no se usa (quedó incompleto); se conserva solo como referencia.
