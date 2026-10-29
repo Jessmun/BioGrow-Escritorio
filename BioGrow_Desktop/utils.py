@@ -294,3 +294,35 @@ def validar_temperatura(temperatura_str: str) -> Tuple[bool, str, str]:
 
     txt_num = f"{int(val)}" if val.is_integer() else f"{val:g}"
     return True, f"{txt_num} °C", ""
+
+# ---------------------------------------------------------------------------
+# Factores del tratamiento (gas, flujo, orientación, morfología)
+# ---------------------------------------------------------------------------
+
+TIPOS_GAS = ["Sin gas", "Aire", "Oxígeno", "Helio", "Argón", "Nitrógeno"]
+ORIENTACIONES = ["Aleatorio", "Embrión", "Endospermo"]
+MORFOLOGIAS = ["Plana", "Bola"]
+
+
+def validar_flujo(flujo_str: str) -> Tuple[bool, Optional[float], str]:
+    """Flujo de gas en litros por minuto. Vacío = sin flujo (None)."""
+    if flujo_str is None or not str(flujo_str).strip():
+        return True, None, ""
+    t = str(flujo_str).lower().replace("l/min", "").replace("lpm", "").strip().replace(",", ".")
+    try:
+        val = float(t)
+    except ValueError:
+        return False, None, "El flujo debe ser un número en litros por minuto (ej: 2 o 2.5) o quedar vacío."
+    if val < 0 or val > 1000:
+        return False, None, "El flujo debe estar entre 0 y 1000 L/min."
+    return True, val, ""
+
+
+def validar_cantidad_semillas(texto: str) -> Tuple[bool, int, str]:
+    try:
+        n = int(str(texto).strip())
+    except ValueError:
+        return False, 0, "La cantidad de semillas debe ser un número entero (ej: 27)."
+    if n < 1 or n > 300:
+        return False, 0, "La cantidad de semillas debe estar entre 1 y 300."
+    return True, n, ""

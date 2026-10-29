@@ -9,9 +9,9 @@ Desarrollada en **Python + CustomTkinter/Tkinter + MySQL**.
 
 ## Funcionalidades
 
-- **Datos del experimento (lote):** identificador del lote, variedad de semilla, fecha de registro y tiempo de tratamiento.
+- **Datos del experimento (lote):** identificador del lote, variedad de semilla, fecha de registro, tiempo de tratamiento, temperatura, **tipo de gas** (Sin gas, Aire, Oxígeno, Helio, Argón, Nitrógeno), **flujo (L/min)**, **orientación** de la semilla (Aleatorio, Embrión, Endospermo) y **morfología** (Plana, Bola).
 - **Variedades disponibles:** `Semilla de maíz blanco`, `Semilla de maíz rosa`, `Semilla de maíz cacahuazintle`, `Semilla de maíz criollo`, `Semilla de lenteja`.
-- **Tabla de captura de 27 muestras** con numeración fija 1–27:
+- **Tabla de captura** de 27 muestras por defecto; la **cantidad de semillas por lote es configurable** (1–300, botón «Aplicar»):
 
   | No. | Longitud Raíz (mm) | Longitud Tallo (mm) | Cantidad de hojas | Estado de Germinación |
   |---|---|---|---|---|
@@ -31,6 +31,12 @@ BioGrow_Desktop/
 ├── database.py              → Acceso a MySQL (DatabaseManager)
 ├── models.py                → Modelos de datos (dataclasses)
 ├── utils.py                 → Validaciones, regla de germinación y formateo
+├── motor_biogrow.py         → Cálculos del dashboard (generado, no editar)
+├── analisis_biogrow.py      → Flujo de análisis, machote de Excel, nombres técnicos
+├── graficas_biogrow.py      → Gráficas del tablero
+├── exportar_biogrow.py      → Exportación de varias gráficas a PDF/Excel
+├── reporte_biogrow.py       → Reporte PDF de los cálculos
+├── generar_motor.py         → Regenera motor_biogrow.py desde dashboardst.py
 ├── requirements.txt         → Dependencias de Python
 ├── BioGrow_Analytics.spec   → Configuración de PyInstaller para generar el .exe
 ├── assets/                  → Recursos (si existe assets/icon.ico se usa como icono)
@@ -246,7 +252,8 @@ Las pestañas 2 y 3 hacen **los mismos cálculos que el dashboard de Streamlit (
 |---|---|
 | `motor_biogrow.py` | Copia fiel de las funciones de cálculo de `dashboardst.py` (lector de Excel, descartes, promedio por caja, descriptivos, ANOVA, Tukey, LSD, letras, cuartiles). Generado con `generar_motor.py`; no se edita a mano. |
 | `analisis_biogrow.py` | Convierte los registros de la base (pestaña 1) al mismo formato que los Excel y ejecuta el flujo de análisis del dashboard. |
-| `graficas_biogrow.py` | Las 9 gráficas del tablero (matplotlib), incluida la de cuartiles con su descripción de los datos. |
+| `graficas_biogrow.py` | Las 12 gráficas del tablero (matplotlib): las 9 del dashboard (incluida cuartiles con su descripción) más Barras + Puntos, Tendencia de grupos y Combinada (cuartiles + puntos + promedio ± DE + letras). |
+| `exportar_biogrow.py` | Exporta una o varias gráficas a un solo PDF o Excel (con hoja «Proyecto», imágenes de las gráficas y, si se elige, las tablas de cálculos). |
 | `reporte_biogrow.py` | Reporte PDF de los cálculos (botón «📄 Reporte PDF de los cálculos» en Cálculos y Modelos). |
 | `generar_motor.py` | Regenera `motor_biogrow.py` si cambia un cálculo en `dashboardst.py`: `python generar_motor.py ruta/a/dashboardst.py motor_biogrow.py` |
 
@@ -254,3 +261,24 @@ Las pestañas 2 y 3 hacen **los mismos cálculos que el dashboard de Streamlit (
 - **Cálculos y Modelos:** variable (raíz, tallo, germinación), comparar por, variedad, cada dato es caja o semilla (si cada grupo tiene una sola caja se usa la semilla automáticamente), unidad mm/cm, α 5 % o 1 % y descartes. Arriba, el dictamen del ANOVA y el resumen de los datos. Sub-pestañas: Resumen, Promedio/DE/varianza, ANOVA, Tukey y LSD. El botón **📄 Reporte PDF de los cálculos** genera un PDF breve: dictamen del ANOVA, ranking con letras y gráfica de promedios, promedio/DE/varianza, tabla ANOVA, y Tukey y LSD (valor crítico, GL, letras y comparaciones).
 - **Tablero & Gráficas:** KPIs y las gráficas con letras de Tukey o LSD, más la gráfica de cuartiles (Q1, mediana, Q3, IQR y atípicos) con una descripción de los datos; usan la misma configuración de Cálculos y Modelos, más los filtros rápidos de variedad, tratamiento y fechas. La barra de herramientas permite zoom y desplazamiento, y la gráfica se guarda en PNG/PDF a 300 DPI.
 - `analytics_engine.py` ya no se usa (quedó incompleto); se conserva solo como referencia.
+
+### Excel en Cálculos y Modelos: recordar e importar
+
+- **Recordar Excel** (casilla, activada por defecto): la lista de Excel cargados se guarda en `biogrow_excels.json`, junto a `biogrow.db`, y se vuelve a cargar sola al abrir la app. Si un archivo ya no existe, se omite. El archivo está en `.gitignore` porque guarda rutas de cada computadora.
+- **📥 Importar a la base:** pasa las semillas de los Excel cargados a `biogrow.db`, con un lote por caja. Después aparecen en el Historial y se pueden editar o borrar como cualquier registro. Antes de guardar muestra un resumen y pide confirmación; se guarda todo o nada.
+  - Las longitudes se guardan en mm y se conserva el estado de germinación del Excel. La cantidad de hojas se importa cuando el Excel la trae (tablas con una semilla por fila); si no, queda vacía.
+  - No se repiten lotes que ya están en la base (mismo nombre y variedad), ni se importan cajas vacías de plantilla ni hojas con un tratamiento por columna (ahí raíz y tallo no son de las mismas semillas).
+  - Los lotes sin fecha en el Excel se registran con la fecha del día de la importación.
+  - La base no tiene campo de parte expuesta: en archivos con Embrión / Endospermo, esa información queda solo en el nombre del lote (p. ej. `T-1M · rep 1 · …`).
+  - Los archivos importados se quitan de «Excel cargados» para no contarlos dos veces.
+
+### Novedades: factores de tratamiento, combinaciones y exportación
+
+- **Machote (plantilla) de Excel:** botón «📋 Plantilla Excel» en Cálculos y Modelos. Genera un Excel vacío con las columnas que entiende la app (Lote, Variedad, No. Muestra, Tratamiento, Temperatura, Tipo de gas, Flujo, Orientación, Morfología, Hojas, Raíz, Tallo, Estado, Fecha) y una hoja «Léeme» con la descripción de cada columna. «Exportar Excel» del historial usa el mismo formato, así que se puede volver a cargar.
+- **Nombres técnicos de variedades:** botón «🏷 Nombres técnicos». Asocia el nombre común con el técnico (p. ej. *Maíz blanco → PBB-DH-183*); se guardan en `biogrow_variedades.json` y aparecen en tablas, gráficas y reportes.
+- **Combinación de tratamientos ("lenteja"):** la opción «Combinación de tratamiento» junta tiempo + temperatura + gas + flujo + orientación + morfología (solo los factores que cambian), para comparar cada combinación como un grupo. También se puede comparar por gas, flujo, orientación o morfología por separado.
+- **Tarjetas en Cálculos y Modelos:** semillas, germinación, grupos y resultado del ANOVA de un vistazo.
+- **Tablero:** filtro por tipo de gas; gráfica de **Tendencia** (eje X: tiempo, temperatura, flujo o fecha; una línea por variedad, gas, orientación, morfología o temperatura, y botón «Elegir series…»); **Barras + Puntos** y **Combinada** (varios análisis en una sola gráfica).
+- **Guardar gráfica** en PNG, PDF o **Excel**; **🗂 Varias gráficas → PDF / Excel** junta las gráficas elegidas en un solo archivo, con la información del proyecto (variedades, lotes, semillas, tratamientos, gases, flujos, fechas) y, en Excel, las tablas de cálculos y los datos de cada grupo.
+- El reporte PDF de los cálculos incluye la tabla «Información del proyecto».
+- La base se actualiza sola al abrir la app (agrega las columnas `gas`, `flujo`, `orientacion`, `morfologia`, `cantidad_semillas` sin borrar datos). Los registros anteriores quedan como *Sin gas · Aleatorio · Plana*.

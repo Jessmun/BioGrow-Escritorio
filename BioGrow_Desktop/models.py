@@ -94,3 +94,8 @@ class DatosLote:
     tiempo_tratamiento: str
     temperatura: str = "Ambiente"
     mediciones: list = field(default_factory=list)
+    gas: str = "Sin gas"
+    flujo: Optional[float] = None
+    orientacion: str = "Aleatorio"
+    morfologia: str = "Plana"
+    cantidad_semillas: int = 27

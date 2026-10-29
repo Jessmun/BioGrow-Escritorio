@@ -66,6 +66,15 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 pass
 
+            # Factores nuevos del tratamiento. Se agregan sin tocar los lotes ya registrados
+            # (en ellos quedan vacíos y el análisis los muestra como 'Sin dato').
+            for columna, tipo in [("gas", "TEXT"), ("flujo", "REAL"), ("orientacion", "TEXT"),
+                                  ("morfologia", "TEXT"), ("cantidad_semillas", "INTEGER")]:
+                try:
+                    cursor.execute(f"ALTER TABLE experimentos ADD COLUMN {columna} {tipo}")
+                except sqlite3.OperationalError:
+                    pass
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS mediciones_semillas (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,9 +121,10 @@ class DatabaseManager:
             cursor.execute(
                 """
                 INSERT INTO experimentos (
-                    nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento, temperatura
+                    nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento, temperatura,
+                    gas, flujo, orientacion, morfologia, cantidad_semillas
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datos.nombre_lote,
@@ -122,6 +132,7 @@ class DatabaseManager:
                     fecha_limpia,
                     datos.tiempo_tratamiento,
                     getattr(datos, "temperatura", None) or "Ambiente",
+                    datos.gas, datos.flujo, datos.orientacion, datos.morfologia, datos.cantidad_semillas,
                 ),
             )
             experimento_id = cursor.lastrowid
@@ -212,6 +223,11 @@ class DatabaseManager:
                 m.num_muestra AS num_muestra,
                 e.tiempo_tratamiento AS tiempo_tratamiento,
                 COALESCE(e.temperatura, 'Ambiente') AS temperatura,
+                e.gas AS gas,
+                e.flujo AS flujo,
+                e.orientacion AS orientacion,
+                e.morfologia AS morfologia,
+                e.cantidad_semillas AS cantidad_semillas,
                 m.longitud_raiz AS longitud_raiz,
                 m.longitud_tallo AS longitud_tallo,
                 m.cantidad_hojas AS cantidad_hojas,
@@ -230,9 +246,12 @@ class DatabaseManager:
                     OR e.tiempo_tratamiento LIKE ?
                     OR e.tipo_semilla LIKE ?
                     OR e.temperatura LIKE ?
+                    OR e.gas LIKE ?
+                    OR e.orientacion LIKE ?
+                    OR e.morfologia LIKE ?
                 )
             """
-            params.extend([like, like, like, like])
+            params.extend([like] * 7)
 
         if filtro_semilla:
             query += " AND e.tipo_semilla = ?"
@@ -269,6 +288,10 @@ class DatabaseManager:
         longitud_tallo: float,
         cantidad_hojas: int,
         temperatura: str = "Ambiente",
+        gas: Optional[str] = None,
+        flujo: Optional[float] = None,
+        orientacion: Optional[str] = None,
+        morfologia: Optional[str] = None,
     ) -> Tuple[bool, str]:
         conn = None
         cursor = None
@@ -282,10 +305,12 @@ class DatabaseManager:
             cursor.execute(
                 """
                 UPDATE experimentos
-                SET nombre_lote = ?, tipo_semilla = ?, tiempo_tratamiento = ?, temperatura = ?
+                SET nombre_lote = ?, tipo_semilla = ?, tiempo_tratamiento = ?, temperatura = ?,
+                    gas = ?, flujo = ?, orientacion = ?, morfologia = ?
                 WHERE id = ?
                 """,
-                (nombre_lote, tipo_semilla, tiempo_tratamiento, temperatura, int(experimento_id)),
+                (nombre_lote, tipo_semilla, tiempo_tratamiento, temperatura, gas, flujo, orientacion,
+                 morfologia, int(experimento_id)),
             )
 
             cursor.execute(
@@ -369,6 +394,56 @@ class DatabaseManager:
             if cursor:
                 cursor.close()
             if conn:
+                conn.close()
+
+    def nombres_de_lotes(self) -> set:
+        """Pares (nombre_lote, tipo_semilla) ya registrados, para no importar dos veces el mismo lote."""
+        conn = self._connect()
+        try:
+            return {(r[0], r[1]) for r in conn.execute("SELECT nombre_lote, tipo_semilla FROM experimentos")}
+        finally:
+            conn.close()
+
+    def guardar_lotes_importados(self, lotes: list) -> Tuple[bool, str]:
+        """Guarda varios lotes leídos de Excel en una sola transacción (todo o nada).
+
+        Cada lote es un dict con nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento,
+        temperatura y mediciones [{num_muestra, longitud_raiz, longitud_tallo, cantidad_hojas, germino}].
+        A diferencia de la captura manual, la cantidad de hojas puede venir vacía y el estado de
+        germinación se toma del Excel.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            conn.execute("BEGIN TRANSACTION;")
+            n_sem = 0
+            for lote in lotes:
+                cur = conn.execute(
+                    "INSERT INTO experimentos (nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento, "
+                    "temperatura, gas, flujo, orientacion, morfologia, cantidad_semillas) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (lote["nombre_lote"], lote["tipo_semilla"], lote["fecha_registro"],
+                     lote["tiempo_tratamiento"], lote.get("temperatura") or "Ambiente",
+                     lote.get("gas"), lote.get("flujo"), lote.get("orientacion"), lote.get("morfologia"),
+                     lote.get("cantidad_semillas") or len(lote["mediciones"])),
+                )
+                exp_id = cur.lastrowid
+                for med in lote["mediciones"]:
+                    conn.execute(
+                        "INSERT INTO mediciones_semillas (experimento_id, num_muestra, longitud_raiz, "
+                        "longitud_tallo, cantidad_hojas, germino) VALUES (?, ?, ?, ?, ?, ?)",
+                        (exp_id, int(med["num_muestra"]), float(med["longitud_raiz"]),
+                         float(med["longitud_tallo"]), med.get("cantidad_hojas"), int(med["germino"])),
+                    )
+                    n_sem += 1
+            conn.commit()
+            return True, f"Se importaron {len(lotes)} lotes con {n_sem} semillas a la base de datos."
+        except Exception as e:
+            if conn is not None:
+                conn.rollback()
+            return False, f"No se importó nada (error al guardar): {e}"
+        finally:
+            if conn is not None:
                 conn.close()
 
     def contar_registros(self) -> dict:

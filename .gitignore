@@ -5,3 +5,6 @@
 __pycache__/
 build/
 dist/
+
+# Lista local de Excel recordados por la app (rutas de cada computadora)
+biogrow_excels.json

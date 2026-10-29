@@ -6,6 +6,7 @@ Cada función recibe el resultado de analisis_biogrow.analizar() y la paleta de 
 """
 from __future__ import annotations
 
+import re
 import textwrap
 
 import numpy as np
@@ -30,7 +31,14 @@ TIPOS = [
     "7. Germinación: Germinaron vs No Germinaron (%)",
     "8. Correlación Alométrica: Raíz vs Tallo (OLS)",
     "9. Cuartiles: Q1, Mediana, Q3, IQR y Atípicos",
+    "10. Barras + Puntos: Promedio ± DE con cada dato",
+    "11. Tendencia: Promedio de los grupos a lo largo de un factor",
+    "12. Combinada: Cuartiles + Puntos + Promedio ± DE + Letras",
 ]
+
+EJES_TENDENCIA = ["Tiempo de tratamiento (s)", "Temperatura", "Flujo (L/min)", "Fecha de registro"]
+SERIES_TENDENCIA = {"Variedad": "Variedad", "Tipo de gas": "Gas", "Orientación": "Orientación",
+                    "Morfología": "Morfología", "Temperatura": "Temperatura", "Ninguna (todos juntos)": None}
 
 
 def _etiqueta(g, ancho=16):
@@ -83,10 +91,20 @@ def _titulo(ax, titulo, subtitulo, p):
 
 
 def _ticks(ax, grupos):
-    rot = 30 if len(grupos) > 7 else 0
-    ax.set_xticks(np.arange(len(grupos)))
+    n = len(grupos)
+    ax.set_xticks(np.arange(n))
+    if n > 16:  # muchos grupos: etiquetas más largas por línea, más inclinadas y pequeñas para que no se encimen
+        ax.set_xticklabels([_etiqueta(g, 30) for g in grupos], rotation=60, ha="right", rotation_mode="anchor",
+                           fontsize=6.5)
+        return
+    rot = 30 if n > 7 else 0
     ax.set_xticklabels([_etiqueta(g) for g in grupos], rotation=rot, ha="right" if rot else "center",
-                       fontsize=8.5 if len(grupos) > 7 else 9)
+                       fontsize=8.5 if n > 7 else 9)
+
+
+def _tam_letras(n):
+    """Tamaño de las letras de significancia según cuántos grupos hay."""
+    return 12 if n <= 12 else (9 if n <= 20 else 7.5)
 
 
 def _mensaje(p, texto):
@@ -115,7 +133,7 @@ def _letras(res, prueba):
 
 
 def _ajustar(fig, n_grupos):
-    abajo = 0.30 if n_grupos > 7 else 0.16
+    abajo = 0.36 if n_grupos > 16 else (0.30 if n_grupos > 7 else 0.16)
     fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=abajo)
 
 
@@ -147,7 +165,7 @@ def barras(res, p, prueba="Tukey", error="Desviación estándar"):
             ax.text(i, y + tope * 0.015, f"{m:.2f}", ha="center", va="bottom", fontsize=8.5,
                     color=p["text_secondary"])
         if mapa.get(g):
-            ax.text(i, y + tope * (0.03 if m > tope * 0.12 else 0.09), mapa[g], ha="center", va="bottom", fontsize=12,
+            ax.text(i, y + tope * (0.03 if m > tope * 0.12 else 0.09), mapa[g], ha="center", va="bottom", fontsize=_tam_letras(len(mapa)),
                     fontweight="bold", color=p["text_primary"],
                     bbox=dict(boxstyle="round,pad=0.25", fc=p["bg_card"], ec=p["border"]))
     ctrl = [i for i, g in enumerate(grupos) if _es_control(g)]
@@ -182,7 +200,7 @@ def cajas(res, p, prueba="Tukey"):
     maximo = max((s.max() for s in series if len(s)), default=1.0)
     for i, (g, s) in enumerate(zip(orden, series)):
         if mapa.get(g) and len(s):
-            ax.text(i, s.max() + maximo * 0.04, mapa[g], ha="center", va="bottom", fontsize=12,
+            ax.text(i, s.max() + maximo * 0.04, mapa[g], ha="center", va="bottom", fontsize=_tam_letras(len(mapa)),
                     fontweight="bold", color=p["text_primary"],
                     bbox=dict(boxstyle="round,pad=0.25", fc=p["bg_card"], ec=p["border"]))
     ax.set_ylim(top=maximo * 1.2 if maximo > 0 else 1)
@@ -439,10 +457,175 @@ def descripcion_cuartiles(res) -> str:
     return "\n".join(lineas)
 
 
-def dibujar(tipo, res, p, prueba="Tukey", error="Desviación estándar"):
+def _valores_grupo(res, g):
+    datos = res["df_an"]
+    return pd.to_numeric(datos.loc[datos["Grupo"].astype(str) == g, res["variable"]], errors="coerce").dropna().to_numpy()
+
+
+def barras_puntos(res, p, prueba="Tukey", error="Desviación estándar"):
+    """Barras del promedio ± DE (o SEM / IC) con cada dato encima como punto."""
+    d = res["desc"].sort_values("Media", ascending=False).reset_index(drop=True)
+    u = res["u"]
+    if error.startswith("Error"):
+        err = d["SEM"].fillna(0).to_numpy()
+    elif error.startswith("IC"):
+        err = (d["IC sup"] - d["Media"]).fillna(0).to_numpy()
+    else:
+        err = d["Desviación estándar"].fillna(0).to_numpy()
+    grupos = d["Grupo"].astype(str).tolist()
+    colores = _colores(grupos)
+    fig, ax = _figura(p)
+    x = np.arange(len(d))
+    ax.bar(x, d["Media"], yerr=err, capsize=5, color=colores, alpha=0.45, edgecolor=p["border"], width=0.65,
+           error_kw=dict(ecolor=p["text_primary"], elinewidth=1.2))
+    rng = np.random.default_rng(11)
+    maximo = 0.0
+    for i, (g, c) in enumerate(zip(grupos, colores)):
+        v = _valores_grupo(res, g)
+        if len(v):
+            maximo = max(maximo, float(v.max()))
+            ax.scatter(i + rng.uniform(-0.2, 0.2, len(v)), v, s=14, color=c, edgecolors=p["text_primary"],
+                       linewidths=0.3, alpha=0.9, zorder=3)
+    mapa = _letras(res, prueba)
+    tope = max(maximo, float(np.nanmax(d["Media"] + err)) if len(d) else 1.0)
+    for i, g in enumerate(grupos):
+        if mapa.get(g):
+            ax.text(i, tope * 1.03, mapa[g], ha="center", va="bottom", fontsize=_tam_letras(len(mapa)), fontweight="bold",
+                    color=p["text_primary"], bbox=dict(boxstyle="round,pad=0.25", fc=p["bg_card"], ec=p["border"]))
+    ax.set_ylim(0, tope * 1.2 if tope > 0 else 1)
+    _ticks(ax, grupos)
+    ax.set_ylabel(f"{res['nombre_var']} ({u})")
+    _titulo(ax, f"{res['nombre_var']}: promedio ± {error.split(' (')[0].lower()} y cada dato — letras de {prueba}",
+            f"Barra: promedio · punto: una {'caja' if res['por_caja'] else 'semilla'} · " + _sub_anova(res), p)
+    _ajustar(fig, len(grupos))
+    return fig
+
+
+def combinada(res, p, prueba="Tukey"):
+    """Varios análisis en una gráfica: cuartiles (caja), cada dato (puntos), promedio ± DE (rombo y barra),
+    letras de Tukey o LSD, línea del control y resultado del ANOVA."""
+    d = res["desc"].sort_values("Media", ascending=False).reset_index(drop=True)
+    grupos = d["Grupo"].astype(str).tolist()
+    colores = _colores(grupos)
+    series = [_valores_grupo(res, g) for g in grupos]
+    fig, ax = _figura(p)
+    pos = np.arange(len(grupos))
+    validas = [i for i, v in enumerate(series) if len(v)]
+    bp = ax.boxplot([series[i] for i in validas], positions=pos[validas], widths=0.6, patch_artist=True,
+                    showfliers=False, medianprops=dict(color=p["text_secondary"], linewidth=1.5),
+                    whiskerprops=dict(color=p["text_muted"]), capprops=dict(color=p["text_muted"]))
+    for patch, i in zip(bp["boxes"], validas):
+        patch.set(facecolor=colores[i], alpha=0.25, edgecolor=colores[i])
+    rng = np.random.default_rng(5)
+    for i, v in enumerate(series):
+        if len(v):
+            ax.scatter(i + rng.uniform(-0.18, 0.18, len(v)), v, s=10, color=colores[i], alpha=0.7, zorder=3)
+    ax.errorbar(pos, d["Media"], yerr=d["Desviación estándar"].fillna(0), fmt="D", color=p["text_primary"],
+                markersize=7, capsize=6, elinewidth=1.8, zorder=4, label="Promedio ± DE")
+    maximo = max([float(v.max()) for v in series if len(v)] + [float(np.nanmax(d["Media"] + d["Desviación estándar"].fillna(0)))])
+    mapa = _letras(res, prueba)
+    for i, g in enumerate(grupos):
+        if mapa.get(g):
+            ax.text(i, maximo * 1.04, mapa[g], ha="center", va="bottom", fontsize=_tam_letras(len(mapa)), fontweight="bold",
+                    color=p["text_primary"], bbox=dict(boxstyle="round,pad=0.25", fc=p["bg_card"], ec=colores[i]))
+    ctrl = [i for i, g in enumerate(grupos) if _es_control(g)]
+    nota_ctrl = ""
+    if len(ctrl) == 1:
+        v_ctrl = float(d["Media"].iloc[ctrl[0]])
+        ax.axhline(v_ctrl, color="#f59e0b", linestyle="--", linewidth=1.4)
+        nota_ctrl = f"línea naranja: control ({v_ctrl:.2f} {res['u']}) · "
+    ax.set_ylim(0, maximo * 1.2 if maximo > 0 else 1)
+    _ticks(ax, grupos)
+    ax.set_ylabel(f"{res['nombre_var']} ({res['u']})")
+    _titulo(ax, f"{res['nombre_var']} por grupo: cuartiles, datos, promedio ± DE y letras de {prueba}",
+            "Caja: Q1–Q3 con mediana · puntos: cada dato · ◆: promedio ± DE · " + nota_ctrl + _sub_anova(res), p)
+    _ajustar(fig, len(grupos))
+    fig.subplots_adjust(top=0.80)
+    return fig
+
+
+def _eje_tendencia(d, eje):
+    """Devuelve (serie del eje X, es_numerico, orden de categorías)."""
+    if eje.startswith("Tiempo"):
+        return pd.to_numeric(d["Tratamiento (s)"], errors="coerce"), True, None
+    if eje.startswith("Flujo"):
+        x = pd.to_numeric(d["Flujo (L/min)"], errors="coerce")
+        return x.where(x.notna(), np.where(d["Clase"].astype(str).eq("S"), 0.0, np.nan)), True, None
+    if eje.startswith("Fecha"):
+        return pd.to_datetime(d["Fecha etiqueta"], errors="coerce", format="mixed").dt.normalize(), True, None
+    t = d["Temperatura"].astype(str)
+    t = t.where(~t.isin(["No registrada", "Sin anotar", "Sin dato", "nan"]))
+    def clave(v):
+        if v == "Control":
+            return (0, 0.0)
+        if v == "Ambiente":
+            return (1, 0.0)
+        m = re.search(r"\d+(?:\.\d+)?", v)
+        return (2, float(m.group()) if m else 0.0)
+    orden = sorted(t.dropna().unique(), key=clave)
+    return t, False, orden
+
+
+def tendencia(res, p, eje="Tiempo de tratamiento (s)", series="Variedad", seleccion=None):
+    """Promedio (± error estándar) de cada serie a lo largo de un factor, para ver tendencias."""
+    var, u = res["variable"], res["u"]
+    d = res["df_semilla"].copy()
+    col_v = M.columna_germinacion(d) if var == "Germinó" else var
+    d["_y"] = pd.to_numeric(d[col_v], errors="coerce") * (100 if var == "Germinó" else 1)
+    d["_x"], numerico, orden = _eje_tendencia(d, eje)
+    col_s = SERIES_TENDENCIA.get(series, "Variedad")
+    d["_s"] = d[col_s].astype(str) if col_s else "Todos"
+    d = d.dropna(subset=["_x", "_y"])
+    d = d[~d["_s"].isin(["Sin dato", "nan"])]
+    if seleccion:
+        d = d[d["_s"].isin(seleccion)]
+    if d.empty or d["_x"].nunique() < 2:
+        return _mensaje(p, f"No hay datos suficientes para ver una tendencia por «{eje}».\n"
+                           "Prueba otro eje o quita filtros (se necesitan al menos 2 valores distintos).")
+    g = d.groupby(["_s", "_x"])["_y"].agg(["mean", "std", "count"]).reset_index()
+    g["sem"] = g["std"] / np.sqrt(g["count"])
+    nombres = sorted(g["_s"].unique())[:12]
+    fig, ax = _figura(p)
+    for k, nombre in enumerate(nombres):
+        sub = g[g["_s"] == nombre]
+        if numerico:
+            sub = sub.sort_values("_x")
+            xs = sub["_x"]
+        else:
+            sub = sub.set_index("_x").reindex([o for o in orden if o in set(sub["_x"])]).reset_index()
+            xs = [orden.index(v) for v in sub["_x"]]
+        c = GRIS_CONTROL if _es_control(nombre) else PALETA[k % len(PALETA)]
+        ax.errorbar(xs, sub["mean"], yerr=sub["sem"].fillna(0), marker="o", markersize=6, linewidth=2, capsize=4,
+                    color=c, label=nombre)
+    if not numerico:
+        ax.set_xticks(range(len(orden)))
+        ax.set_xticklabels(orden)
+    elif eje.startswith("Fecha"):
+        fig.autofmt_xdate()
+    ax.grid(True, axis="x", linestyle="--", alpha=0.2, color=p["text_muted"])
+    ax.set_xlabel(eje)
+    ax.set_ylabel(f"{res['nombre_var']} promedio ({u})")
+    ax.legend(facecolor=p["bg_secondary"], edgecolor=p["border"], labelcolor=p["text_primary"], fontsize=8.5,
+              title=series, title_fontsize=8.5, loc="best", ncol=2 if len(nombres) > 6 else 1)
+    leg = ax.get_legend()
+    if leg is not None:
+        leg.get_title().set_color(p["text_primary"])
+    _titulo(ax, f"Tendencia de {res['nombre_var'].lower()} según {eje.lower()}",
+            "Cada punto: promedio de las semillas ± error estándar · mismos filtros y descartes del análisis", p)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.14)
+    return fig
+
+
+def dibujar(tipo, res, p, prueba="Tukey", error="Desviación estándar", opciones_tendencia=None):
     if not res or not res.get("ok"):
         return _mensaje(p, (res or {}).get("mensaje") or "Sin datos para graficar.")
     n = tipo.split(".")[0]
+    if n == "10":
+        return barras_puntos(res, p, prueba, error)
+    if n == "11":
+        return tendencia(res, p, **(opciones_tendencia or {}))
+    if n == "12":
+        return combinada(res, p, prueba)
     if n == "1":
         return barras(res, p, prueba, error)
     if n == "2":

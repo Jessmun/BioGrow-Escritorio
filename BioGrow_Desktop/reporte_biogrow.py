@@ -125,6 +125,11 @@ def generar_pdf(ruta: str, res: dict, config: dict, paleta_clara: dict) -> None:
         f"{'—' if pd.isna(germ) else f'{germ:.1f} %'} · {m['Registros descartados']} registros descartados"),
         est["normal"]))
 
+    proyecto = config.get("proyecto")
+    if proyecto is not None and not proyecto.empty:
+        el.append(Paragraph("Información del proyecto", est["h2"]))
+        el.append(_tabla(proyecto, est, fuente, negrita, ancho * 0.8, tam=8))
+
     el.append(Paragraph("1. Ranking con letras de Tukey y LSD", est["h2"]))
     el.append(_tabla(res["ranking"], est, fuente, negrita, ancho, dec=2, tam=8))
     try:

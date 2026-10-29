@@ -432,8 +432,9 @@ CONFIG_TIPO = {
         "pregunta": "¿Qué temperatura del tratamiento da raíces o tallos más largos que el control (T-01)?",
     },
     TIPO_LARGO: {
-        "dims": ["Tratamiento", "Variedad", "Temperatura", "Bloque", "Fecha etiqueta", "Archivo"],
-        "default": ["Variedad", "Tratamiento"],
+        "dims": ["Combinación", "Tratamiento", "Variedad", "Temperatura", "Gas", "Flujo", "Orientación",
+                 "Morfología", "Bloque", "Fecha etiqueta", "Archivo"],
+        "default": ["Variedad", "Combinación"],
         "descripcion": (
             "Tabla con **una semilla por fila**: lote (caja), variedad, tratamiento, temperatura, raíz y "
             "tallo (en **mm** en el Excel), estado de germinación y fecha. "
@@ -680,6 +681,10 @@ def _extraer_hoja_columnas(nombre_hoja, celdas, advertencias, nombre_archivo="")
     return registros
 
 _COLUMNAS_LARGO = {
+    "gas": r"\bgas\b|atm[oó]sfera",
+    "flujo": r"flujo|caudal|l\s*/\s*min",
+    "orientacion": r"orientaci|cara expuesta|posici[oó]n",
+    "morfologia": r"morfolog|forma de (la )?semilla",
     "raiz": r"ra[ií]z|radícula|radicula",
     "tallo": r"tallo|hipoc[oó]tilo|v[aá]stago",
     "caja": r"lote|caja|corrida|bloque|placa|petri|unidad",
@@ -763,6 +768,49 @@ def _temperatura_de_texto(v):
         return f"{n:g} °C", n
     return t, np.nan
 
+_GASES = {"aire": "Aire", "ox": "Oxígeno", "hel": "Helio", "arg": "Argón", "nit": "Nitrógeno",
+          "co2": "CO₂", "dióx": "CO₂", "diox": "CO₂"}
+
+def _gas_de_texto(v):
+    t = str(v or "").strip()
+    if not t:
+        return "Sin dato"
+    tl = t.lower()
+    if re.match(r"(sin|ningun|no aplica|n/?a|—|-|control)", tl):
+        return "Sin gas"
+    for clave, nombre in _GASES.items():
+        if tl.startswith(clave):
+            return nombre
+    return t[:1].upper() + t[1:]
+
+def _flujo_de_texto(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    m = re.search(r"\d+(?:[.,]\d+)?", str(v or ""))
+    return float(m.group().replace(",", ".")) if m else np.nan
+
+def _orientacion_de_texto(v):
+    t = str(v or "").strip().lower()
+    if not t:
+        return "Sin dato"
+    if t.startswith("emb"):
+        return "Embrión"
+    if t.startswith("endo"):
+        return "Endospermo"
+    if t.startswith(("alea", "azar", "random")):
+        return "Aleatorio"
+    return str(v).strip().capitalize()
+
+def _morfologia_de_texto(v):
+    t = str(v or "").strip().lower()
+    if not t:
+        return "Sin dato"
+    if t.startswith("plan"):
+        return "Plana"
+    if t.startswith(("bol", "redond", "esf")):
+        return "Bola"
+    return str(v).strip().capitalize()
+
 def _nombre_variedad(v):
     t = re.sub(r"\s+", " ", str(v or "").strip())
     t = re.sub(r"^semillas?\s+de\s+", "", t, flags=re.IGNORECASE)
@@ -814,7 +862,13 @@ def _extraer_hoja_larga(nombre_hoja, celdas, advertencias, nombre_archivo=""):
             etiqueta_trat = f"{texto_trat} · {temp_lbl}" if texto_trat else temp_lbl
         fecha = valor(f, "fecha")
         fecha_txt = str(fecha)[:10] if fecha not in (None, "") else ""
+        flujo = _flujo_de_texto(valor(f, "flujo")) if "flujo" in m else np.nan
         registros.append({
+            "Gas": _gas_de_texto(valor(f, "gas")) if "gas" in m else "Sin dato",
+            "Flujo (L/min)": flujo,
+            "Flujo": (f"{flujo:g} L/min" if pd.notna(flujo) else ("Sin flujo" if "flujo" in m else "Sin dato")),
+            "Orientación": _orientacion_de_texto(valor(f, "orientacion")) if "orientacion" in m else "Sin dato",
+            "Morfología": _morfologia_de_texto(valor(f, "morfologia")) if "morfologia" in m else "Sin dato",
             "Hoja": etiqueta_hoja, "Fecha etiqueta": fecha_txt or etiqueta_hoja, "Día": None, "Mes": None,
             "Color": variedad, "Tirada": 0 if control else 1, "Paridad": "Par" if control else "Impar",
             "Clase": "S" if control else "T", "Clase nombre": "Patrón" if control else "Tratada",
@@ -856,6 +910,8 @@ def cargar_datos(fuente, nombre_archivo=None):
     for nombre_hoja, celdas in _leer_libro(fuente):
         if not celdas:
             continue
+        if re.match(r"\s*(l[eé]eme|instrucciones|readme|notas)\b", nombre_hoja, re.IGNORECASE):
+            continue  # hojas de ayuda (p. ej. en la plantilla), no traen datos
         if _es_formato_largo(celdas):
             tipo = TIPO_LARGO
             registros = _extraer_hoja_larga(nombre_hoja, celdas, advertencias, nombre_archivo)
@@ -903,6 +959,15 @@ def _postprocesar(df):
         df[col] = df[col].fillna(defecto)
     if "Temperatura (°C)" not in df.columns:
         df["Temperatura (°C)"] = np.nan
+    for col in ("Gas", "Flujo", "Orientación", "Morfología"):
+        if col not in df.columns:
+            df[col] = "Sin dato"
+        df[col] = df[col].fillna("Sin dato")
+    if "Flujo (L/min)" not in df.columns:
+        df["Flujo (L/min)"] = np.nan
+    # En los formatos con bloques M / N la orientación es la parte expuesta.
+    sin_or = (df["Orientación"] == "Sin dato") & df["Clase nombre"].isin(["Embrión", "Endospermo"])
+    df.loc[sin_or, "Orientación"] = df.loc[sin_or, "Clase nombre"]
 
     # Todas las longitudes se trabajan en cm: lo medido en cm se respeta tal cual
     # y lo medido en mm se divide entre 10.
@@ -925,6 +990,35 @@ def _postprocesar(df):
         + " | " + df["Hoja"].astype(str)
     )
     return df
+
+FACTORES_COMBINACION = ["Temperatura", "Gas", "Flujo", "Orientación", "Morfología"]
+
+def agregar_combinacion(df):
+    """Columna 'Combinación': el tratamiento completo de cada lote (tiempo + los factores que
+    cambian dentro de su variedad: temperatura, gas, flujo, orientación y morfología).
+    Así, en la lenteja (sin variación de temperatura) se comparan combinaciones como
+    '45 s · Argón · 2 L/min · Embrión'. Los factores constantes no se repiten en la etiqueta."""
+    if df.empty:
+        return df
+    d = df.copy()
+    tiempo = d["Tratamiento (s)"].apply(_etiqueta_tratamiento)
+    control = d["Clase"].astype(str).eq("S") | tiempo.eq("Control (0 s)")
+    vacios = {"Sin dato", "No registrada", "Sin anotar", "Control", "nan", ""}
+    comb = pd.Series("", index=d.index, dtype=object)
+    for variedad, idx in d.groupby(d["Variedad"].astype(str)).groups.items():
+        sub = d.loc[idx]
+        tratados = sub[~control.loc[idx]]
+        usar = [c for c in FACTORES_COMBINACION if c in sub.columns
+                and tratados[c].astype(str).loc[~tratados[c].astype(str).isin(vacios)].nunique() > 1]
+        for i in idx:
+            if control.loc[i]:
+                partes = ["Control (0 s)"]
+            else:
+                partes = [tiempo.loc[i]] if tiempo.loc[i] != "Sin definir" else []
+                partes += [str(d.at[i, c]) for c in usar if str(d.at[i, c]) not in vacios]
+            comb.loc[i] = " · ".join(partes) or "Sin definir"
+    d["Combinación"] = comb
+    return d
 
 def cargar_varios(fuentes):
     """fuentes: lista de rutas o de tuplas (nombre, bytes)."""
@@ -2393,6 +2487,70 @@ async function preparar(){
 }
 preparar();
 """
+
+def preparar_patron_vs_corridas(df_semilla, dims, variable, por_caja, juntar_patrones=False):
+    """Arma los grupos para comparar los patrones (Clase S, sin tratamiento) contra las corridas.
+    Patrones: cada uno por separado (T-01, T-02…) o todos juntos. Corridas: agrupadas con
+    'Comparar por'. Devuelve (datos de análisis, datos por semilla, por_caja_usado, lista patrones)."""
+    d = df_semilla.copy()
+    es_patron = d["Clase"].astype(str) == "S"
+    if not es_patron.any() or es_patron.all():
+        return None
+    pat = d[es_patron]
+    varias_var = pat["Variedad"].nunique() > 1
+    if juntar_patrones:
+        etiqueta = pd.Series("Patrón", index=pat.index)
+    else:
+        etiqueta = "Patrón " + pat["Bloque"].astype(str)
+        if pat["Hoja"].nunique() > 1:
+            etiqueta = etiqueta + " · " + pat["Hoja"].astype(str)
+    if varias_var:
+        etiqueta = etiqueta + " · " + pat["Variedad"].astype(str)
+    d.loc[es_patron, "Grupo"] = etiqueta
+    dims_corr = [x for x in dims if x != "Corrida"] or ["Tratamiento"]
+    d.loc[~es_patron, "Grupo"] = construir_grupo(d[~es_patron], dims_corr).astype(str)
+    d["Rol"] = np.where(es_patron, "Patrón", "Corrida")
+
+    cajas = d.groupby("Grupo")["Corrida"].nunique()
+    usar_caja = bool(por_caja and cajas.min() >= 2)
+    if usar_caja:
+        df_an = agregar_por_unidad(d, variable, COLUMNAS_CAJA + ["Rol"])
+    else:
+        df_an = d.dropna(subset=[variable]).copy()
+        if variable == "Germinó":
+            df_an[variable] = pd.to_numeric(df_an[variable], errors="coerce") * 100
+    patrones = sorted(d.loc[es_patron, "Grupo"].unique())
+    return df_an, d, usar_caja, patrones
+
+def _veredicto(fila, corrida):
+    """Texto corto para una comparación corrida vs patrón."""
+    if fila is None:
+        return "—"
+    dif = fila["Media 1"] - fila["Media 2"] if fila["Grupo 1"] == corrida else fila["Media 2"] - fila["Media 1"]
+    if fila["Resultado"] == SIG:
+        return "▲ Mayor (✔ difiere)" if dif > 0 else "▼ Menor (✔ difiere)"
+    return "＝ No difiere (✘)"
+
+def matriz_corrida_vs_patron(desc, tk, ls, patrones, u):
+    corridas = desc[~desc["Grupo"].isin(patrones)].sort_values("Media", ascending=False)
+    media = dict(zip(desc["Grupo"], desc["Media"]))
+
+    def buscar(tabla, a, b):
+        if tabla is None or tabla.empty:
+            return None
+        m = ((tabla["Grupo 1"] == a) & (tabla["Grupo 2"] == b)) | ((tabla["Grupo 1"] == b) & (tabla["Grupo 2"] == a))
+        return tabla[m].iloc[0] if m.any() else None
+
+    filas = []
+    for _, c in corridas.iterrows():
+        fila = {"Corrida": c["Grupo"], f"Promedio ({u})": c["Media"]}
+        for p in patrones:
+            corto = p.replace("Patrón ", "")
+            fila[f"{corto}: diferencia ({u})"] = c["Media"] - media.get(p, np.nan)
+            fila[f"{corto}: Tukey"] = _veredicto(buscar(tk, c["Grupo"], p), c["Grupo"])
+            fila[f"{corto}: LSD"] = _veredicto(buscar(ls, c["Grupo"], p), c["Grupo"])
+        filas.append(fila)
+    return pd.DataFrame(filas)
 
 def _semillas_para_excel(crudo, analizado, tabla_cajas, variable):
     """Una fila por semilla, con las columnas que usa el programa para los cálculos."""
