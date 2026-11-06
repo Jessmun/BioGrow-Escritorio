@@ -37,7 +37,7 @@ TIPOS = [
 ]
 
 EJES_TENDENCIA = ["Tiempo de tratamiento (s)", "Temperatura", "Flujo (L/min)", "Fecha de registro"]
-SERIES_TENDENCIA = {"Variedad": "Variedad", "Tipo de gas": "Gas", "Orientación": "Orientación",
+SERIES_TENDENCIA = {"Variedad": "Variedad", "Tipo de tratamiento": "Tipo de tratamiento", "Tipo de gas": "Gas", "Orientación": "Orientación",
                     "Morfología": "Morfología", "Temperatura": "Temperatura", "Ninguna (todos juntos)": None}
 
 

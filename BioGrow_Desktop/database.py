@@ -69,7 +69,8 @@ class DatabaseManager:
             # Factores nuevos del tratamiento. Se agregan sin tocar los lotes ya registrados
             # (en ellos quedan vacíos y el análisis los muestra como 'Sin dato').
             for columna, tipo in [("gas", "TEXT"), ("flujo", "REAL"), ("orientacion", "TEXT"),
-                                  ("morfologia", "TEXT"), ("cantidad_semillas", "INTEGER")]:
+                                  ("morfologia", "TEXT"), ("cantidad_semillas", "INTEGER"),
+                                  ("tipo_tratamiento", "TEXT")]:
                 try:
                     cursor.execute(f"ALTER TABLE experimentos ADD COLUMN {columna} {tipo}")
                 except sqlite3.OperationalError:
@@ -122,9 +123,9 @@ class DatabaseManager:
                 """
                 INSERT INTO experimentos (
                     nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento, temperatura,
-                    gas, flujo, orientacion, morfologia, cantidad_semillas
+                    gas, flujo, orientacion, morfologia, cantidad_semillas, tipo_tratamiento
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datos.nombre_lote,
@@ -133,6 +134,7 @@ class DatabaseManager:
                     datos.tiempo_tratamiento,
                     getattr(datos, "temperatura", None) or "Ambiente",
                     datos.gas, datos.flujo, datos.orientacion, datos.morfologia, datos.cantidad_semillas,
+                    getattr(datos, "tipo_tratamiento", None) or "Plasma",
                 ),
             )
             experimento_id = cursor.lastrowid
@@ -227,6 +229,7 @@ class DatabaseManager:
                 e.flujo AS flujo,
                 e.orientacion AS orientacion,
                 e.morfologia AS morfologia,
+                COALESCE(e.tipo_tratamiento, 'Plasma') AS tipo_tratamiento,
                 e.cantidad_semillas AS cantidad_semillas,
                 m.longitud_raiz AS longitud_raiz,
                 m.longitud_tallo AS longitud_tallo,
@@ -249,9 +252,10 @@ class DatabaseManager:
                     OR e.gas LIKE ?
                     OR e.orientacion LIKE ?
                     OR e.morfologia LIKE ?
+                    OR e.tipo_tratamiento LIKE ?
                 )
             """
-            params.extend([like] * 7)
+            params.extend([like] * 8)
 
         if filtro_semilla:
             query += " AND e.tipo_semilla = ?"
@@ -292,6 +296,7 @@ class DatabaseManager:
         flujo: Optional[float] = None,
         orientacion: Optional[str] = None,
         morfologia: Optional[str] = None,
+        tipo_tratamiento: Optional[str] = None,
     ) -> Tuple[bool, str]:
         conn = None
         cursor = None
@@ -306,11 +311,11 @@ class DatabaseManager:
                 """
                 UPDATE experimentos
                 SET nombre_lote = ?, tipo_semilla = ?, tiempo_tratamiento = ?, temperatura = ?,
-                    gas = ?, flujo = ?, orientacion = ?, morfologia = ?
+                    gas = ?, flujo = ?, orientacion = ?, morfologia = ?, tipo_tratamiento = ?
                 WHERE id = ?
                 """,
                 (nombre_lote, tipo_semilla, tiempo_tratamiento, temperatura, gas, flujo, orientacion,
-                 morfologia, int(experimento_id)),
+                 morfologia, tipo_tratamiento or "Plasma", int(experimento_id)),
             )
 
             cursor.execute(
@@ -420,12 +425,13 @@ class DatabaseManager:
             for lote in lotes:
                 cur = conn.execute(
                     "INSERT INTO experimentos (nombre_lote, tipo_semilla, fecha_registro, tiempo_tratamiento, "
-                    "temperatura, gas, flujo, orientacion, morfologia, cantidad_semillas) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "temperatura, gas, flujo, orientacion, morfologia, cantidad_semillas, tipo_tratamiento) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (lote["nombre_lote"], lote["tipo_semilla"], lote["fecha_registro"],
                      lote["tiempo_tratamiento"], lote.get("temperatura") or "Ambiente",
                      lote.get("gas"), lote.get("flujo"), lote.get("orientacion"), lote.get("morfologia"),
-                     lote.get("cantidad_semillas") or len(lote["mediciones"])),
+                     lote.get("cantidad_semillas") or len(lote["mediciones"]),
+                     lote.get("tipo_tratamiento") or "Plasma"),
                 )
                 exp_id = cur.lastrowid
                 for med in lote["mediciones"]:

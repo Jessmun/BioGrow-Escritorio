@@ -19,7 +19,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=mysql_binaries,
-    datas=[],
+    datas=[('imagenes', 'imagenes')],  # ilustraciones de fondo de cada pestaña
     hiddenimports=mysql_hiddenimports,
     hookspath=[],
     hooksconfig={},

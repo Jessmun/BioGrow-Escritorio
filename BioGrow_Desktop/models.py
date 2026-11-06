@@ -99,3 +99,4 @@ class DatosLote:
     orientacion: str = "Aleatorio"
     morfologia: str = "Plana"
     cantidad_semillas: int = 27
+    tipo_tratamiento: str = "Plasma"

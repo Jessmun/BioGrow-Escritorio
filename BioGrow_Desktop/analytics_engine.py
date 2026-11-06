@@ -161,6 +161,8 @@ def _color_de_hoja(nombre_hoja: str) -> str:
         return "R"
     if "blanc" in texto or re.search(r"datos-?b\b", texto):
         return "B"
+    if "lenteja" in texto:
+        return "L"
     return "?"
 
 
@@ -552,10 +554,12 @@ def cargar_archivos_excel(rutas: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     mapa_var = {
         "B": "Semilla de maíz blanco (PBB-DH-183)",
         "R": "Semilla de maíz rosa (H-392 A)",
-        "C": "Semilla de maíz cacahuazintle",
-        "CR": "Semilla de maíz criollo",
-        "CACAHUAZINTLE": "Semilla de maíz cacahuazintle",
-        "CRIOLLO": "Semilla de maíz criollo",
+        "C": "Semilla de maíz cacahuazintle (Zea mays var. amylacea)",
+        "CR": "Semilla de maíz criollo (Zea mays nativo)",
+        "CACAHUAZINTLE": "Semilla de maíz cacahuazintle (Zea mays var. amylacea)",
+        "CRIOLLO": "Semilla de maíz criollo (Zea mays nativo)",
+        "L": "Semilla de lenteja (Lens culinaris)",
+        "LENTEJA": "Semilla de lenteja (Lens culinaris)",
     }
 
     for ruta in rutas:

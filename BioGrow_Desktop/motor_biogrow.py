@@ -432,8 +432,8 @@ CONFIG_TIPO = {
         "pregunta": "¿Qué temperatura del tratamiento da raíces o tallos más largos que el control (T-01)?",
     },
     TIPO_LARGO: {
-        "dims": ["Combinación", "Tratamiento", "Variedad", "Temperatura", "Gas", "Flujo", "Orientación",
-                 "Morfología", "Bloque", "Fecha etiqueta", "Archivo"],
+        "dims": ["Combinación", "Tratamiento", "Tipo de tratamiento", "Variedad", "Temperatura", "Gas", "Flujo",
+                 "Orientación", "Morfología", "Bloque", "Fecha etiqueta", "Archivo"],
         "default": ["Variedad", "Combinación"],
         "descripcion": (
             "Tabla con **una semilla por fila**: lote (caja), variedad, tratamiento, temperatura, raíz y "
@@ -681,6 +681,7 @@ def _extraer_hoja_columnas(nombre_hoja, celdas, advertencias, nombre_archivo="")
     return registros
 
 _COLUMNAS_LARGO = {
+    "tipo_trat": r"tipo\s*de\s*tratamiento|tipo\s*trat|m[eé]todo|agente",
     "gas": r"\bgas\b|atm[oó]sfera",
     "flujo": r"flujo|caudal|l\s*/\s*min",
     "orientacion": r"orientaci|cara expuesta|posici[oó]n",
@@ -762,14 +763,28 @@ def _temperatura_de_texto(v):
         return "No registrada", np.nan
     if re.match(r"amb", t, re.IGNORECASE):
         return "Ambiente", np.nan
-    m = re.search(r"\d+(?:[.,]\d+)?", t)
-    if m:
-        n = float(m.group().replace(",", "."))
+    simple = re.fullmatch(r"(-?\d+(?:[.,]\d+)?)\s*(?:°\s*c?|º\s*c?|c|grados)?", t, re.IGNORECASE)
+    if simple:
+        n = float(simple.group(1).replace(",", "."))
         return f"{n:g} °C", n
-    return t, np.nan
+    # Texto libre (ej. '35-40 °C', 'Variable'): se respeta tal cual; el primer número sirve para ordenar
+    m = re.search(r"-?\d+(?:[.,]\d+)?", t)
+    return t, (float(m.group().replace(",", ".")) if m else np.nan)
 
 _GASES = {"aire": "Aire", "ox": "Oxígeno", "hel": "Helio", "arg": "Argón", "nit": "Nitrógeno",
           "co2": "CO₂", "dióx": "CO₂", "diox": "CO₂"}
+
+def _tipo_tratamiento_de_texto(v):
+    """Plasma, Salino, Térmico o Solución (cualquier otro texto se respeta)."""
+    t = str(v or "").strip()
+    if not t:
+        return "Sin dato"
+    tl = t.lower()
+    for clave, nombre in (("plasm", "Plasma"), ("sal", "Salino"), ("térm", "Térmico"), ("term", "Térmico"),
+                          ("calor", "Térmico"), ("solu", "Solución")):
+        if tl.startswith(clave):
+            return nombre
+    return t[:1].upper() + t[1:]
 
 def _gas_de_texto(v):
     t = str(v or "").strip()
@@ -864,6 +879,8 @@ def _extraer_hoja_larga(nombre_hoja, celdas, advertencias, nombre_archivo=""):
         fecha_txt = str(fecha)[:10] if fecha not in (None, "") else ""
         flujo = _flujo_de_texto(valor(f, "flujo")) if "flujo" in m else np.nan
         registros.append({
+            "Tipo de tratamiento": (_tipo_tratamiento_de_texto(valor(f, "tipo_trat")) if "tipo_trat" in m
+                                    else "Sin dato"),
             "Gas": _gas_de_texto(valor(f, "gas")) if "gas" in m else "Sin dato",
             "Flujo (L/min)": flujo,
             "Flujo": (f"{flujo:g} L/min" if pd.notna(flujo) else ("Sin flujo" if "flujo" in m else "Sin dato")),
@@ -959,7 +976,7 @@ def _postprocesar(df):
         df[col] = df[col].fillna(defecto)
     if "Temperatura (°C)" not in df.columns:
         df["Temperatura (°C)"] = np.nan
-    for col in ("Gas", "Flujo", "Orientación", "Morfología"):
+    for col in ("Tipo de tratamiento", "Gas", "Flujo", "Orientación", "Morfología"):
         if col not in df.columns:
             df[col] = "Sin dato"
         df[col] = df[col].fillna("Sin dato")
@@ -991,11 +1008,11 @@ def _postprocesar(df):
     )
     return df
 
-FACTORES_COMBINACION = ["Temperatura", "Gas", "Flujo", "Orientación", "Morfología"]
+FACTORES_COMBINACION = ["Tipo de tratamiento", "Temperatura", "Gas", "Flujo", "Orientación", "Morfología"]
 
 def agregar_combinacion(df):
     """Columna 'Combinación': el tratamiento completo de cada lote (tiempo + los factores que
-    cambian dentro de su variedad: temperatura, gas, flujo, orientación y morfología).
+    cambian dentro de su variedad: tipo de tratamiento, temperatura, gas, flujo, orientación y morfología).
     Así, en la lenteja (sin variación de temperatura) se comparan combinaciones como
     '45 s · Argón · 2 L/min · Embrión'. Los factores constantes no se repiten en la etiqueta."""
     if df.empty:

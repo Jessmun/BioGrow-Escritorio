@@ -35,6 +35,8 @@ BioGrow_Desktop/
 ├── analisis_biogrow.py      → Flujo de análisis, machote de Excel, nombres técnicos
 ├── graficas_biogrow.py      → Gráficas del tablero
 ├── exportar_biogrow.py      → Exportación de varias gráficas a PDF/Excel
+├── fondos_biogrow.py        → Ilustraciones difuminadas detrás de tablas y gráficas
+├── imagenes/                → fondo_registro.png, fondo_calculos.png, fondo_tablero.png
 ├── reporte_biogrow.py       → Reporte PDF de los cálculos
 ├── generar_motor.py         → Regenera motor_biogrow.py desde dashboardst.py
 ├── requirements.txt         → Dependencias de Python
@@ -282,3 +284,35 @@ Las pestañas 2 y 3 hacen **los mismos cálculos que el dashboard de Streamlit (
 - **Guardar gráfica** en PNG, PDF o **Excel**; **🗂 Varias gráficas → PDF / Excel** junta las gráficas elegidas en un solo archivo, con la información del proyecto (variedades, lotes, semillas, tratamientos, gases, flujos, fechas) y, en Excel, las tablas de cálculos y los datos de cada grupo.
 - El reporte PDF de los cálculos incluye la tabla «Información del proyecto».
 - La base se actualiza sola al abrir la app (agrega las columnas `gas`, `flujo`, `orientacion`, `morfologia`, `cantidad_semillas` sin borrar datos). Los registros anteriores quedan como *Sin gas · Aleatorio · Plana*.
+
+### Integración con la versión de Hibrain
+
+- **Nombres técnicos y científicos de las variedades** en la captura: Maíz blanco (PBB-DH-183), Maíz rosa (H-392 A),
+  Maíz cacahuazintle (*Zea mays* var. *amylacea*), Maíz criollo (*Zea mays* nativo) y Lenteja (*Lens culinaris*).
+  El catálogo está en `analisis_biogrow.TIPOS_SEMILLA` y los nombres se pueden cambiar con «🏷 Nombres técnicos».
+- Los lotes guardados con el nombre corto («Semilla de maíz rosa») y los nuevos con nombre científico se analizan,
+  filtran e importan **como la misma variedad** (no se duplican grupos ni lotes).
+- La lenteja se reconoce también en el motor anterior (`analytics_engine.py`).
+- **📥 Importar** en el Historial: elige uno o más Excel y guarda sus lotes directo en la base (usa el mismo lector
+  que «Cargar Excel», así que también trae gas, flujo, orientación y morfología, y no repite lotes ya guardados).
+- Filtros del Historial corregidos: los tiempos escritos como `45`, `45 s` o `45s` cuentan como el mismo, y la lista
+  de tratamientos y variedades se arma con lo que hay en la base (antes, un tiempo fuera de Control/30s/45s/60s
+  no aparecía en el Historial).
+- Al editar un lote se conserva su variedad (antes una variedad con nombre distinto se cambiaba a la primera).
+
+### Ilustraciones de cada pestaña
+
+Cada pestaña tiene su ilustración difuminada **detrás** de sus datos, sin ocupar espacio propio:
+la semilla germinando detrás del Historial, las plantas comparadas detrás de las tablas de Cálculos y Modelos,
+y el maíz con líneas de flujo detrás de la gráfica del Tablero. El fondo oscuro de cada imagen se vuelve
+transparente, se atenúa y se coloca a la derecha para no tapar la primera columna; se ajusta al tamaño de la tabla
+y al tema claro/oscuro. Las gráficas que se guardan o exportan salen limpias, sin ilustración.
+Para cambiar una imagen basta con reemplazar el archivo en `imagenes/` con el mismo nombre.
+
+### Tipo de tratamiento y temperatura libre
+
+- Nuevo campo **Tipo de tratamiento**: Plasma, Salino, Térmico o Solución (columna `tipo_tratamiento` en la base;
+  los lotes anteriores quedan como Plasma). Aparece en la captura, el Historial, la edición, el machote de Excel,
+  la combinación de tratamiento («45 s · Salino · …»), «Comparar por» y las series de la gráfica de tendencia.
+- **Temperatura abierta**: acepta cualquier texto (35, 35-40 °C, Variable…). Un número solo se guarda como «35 °C»
+  y el campo vacío como «Ambiente».

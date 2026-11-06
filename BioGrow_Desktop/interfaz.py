@@ -6,6 +6,8 @@ interfaz.py — Interfaz gráfica de BioGrow Desktop
 - Modo Administrador con Edición y Eliminación de registros y lotes.
 - Exportación a Excel (.xlsx) y PDF (.pdf) con diseño profesional.
 """
+import json
+import re
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
@@ -25,6 +27,12 @@ from utils import (
     centrar_ventana,
     truncar_texto,
     validar_temperatura,
+    validar_flujo,
+    validar_cantidad_semillas,
+    TIPOS_GAS,
+    TIPOS_TRATAMIENTO,
+    ORIENTACIONES,
+    MORFOLOGIAS,
 )
 
 import pandas as pd
@@ -36,6 +44,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 import analisis_biogrow as AN
 import graficas_biogrow as GR
 import reporte_biogrow as REP
+import exportar_biogrow as EX
+import fondos_biogrow as FD
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -92,13 +102,9 @@ TTK_PALETTES = {
 }
 
 NUM_MUESTRAS = 27
-TIPOS_SEMILLA = [
-    "Semilla de maíz blanco",
-    "Semilla de maíz rosa",
-    "Semilla de maíz cacahuazintle",
-    "Semilla de maíz criollo",
-    "Semilla de lenteja",
-]
+# Variedades con su nombre técnico (híbrido) o científico entre paréntesis (catálogo en analisis_biogrow)
+TIPOS_SEMILLA = list(AN.TIPOS_SEMILLA)
+TRATAMIENTOS_BASE = ["Control", "30s", "45s", "60s"]
 ADMIN_PIN = "admin123"
 
 
@@ -110,6 +116,7 @@ class BioGrowApp(ctk.CTk):
         self._admin_activo = False
 
         self._filas_captura: list = []
+        self._num_muestras: int = NUM_MUESTRAS
         self._datos_historial_actual: list = []
         self._entry_activo: Optional[tk.Widget] = None
         self._celda_activa: Optional[tuple] = None
@@ -216,10 +223,12 @@ class BioGrowApp(ctk.CTk):
             self._tree_captura.tag_configure("alt_no", background=p["row_alt"], foreground=p["text_muted"])
 
         if hasattr(self, "_tree_historial"):
-            self._tree_historial.tag_configure("germino_si", foreground=p["accent_green"], background=p["bg_card"])
-            self._tree_historial.tag_configure("germino_no", foreground=p["accent_red"], background=p["bg_card"])
-            self._tree_historial.tag_configure("alt_si", background=p["row_alt"], foreground=p["accent_green"])
-            self._tree_historial.tag_configure("alt_no", background=p["row_alt"], foreground=p["accent_red"])
+            t = self._tree_historial
+            t.tag_configure("germino_si", foreground=p["accent_green"], background=self._bg_fila(t, p["bg_card"]))
+            t.tag_configure("germino_no", foreground=p["accent_red"], background=self._bg_fila(t, p["bg_card"]))
+            t.tag_configure("alt_si", background=self._bg_fila(t, p["row_alt"]), foreground=p["accent_green"])
+            t.tag_configure("alt_no", background=self._bg_fila(t, p["row_alt"]), foreground=p["accent_red"])
+        self._refrescar_fondos_tablas()
 
     def _construir_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -346,6 +355,74 @@ class BioGrowApp(ctk.CTk):
         self._construir_seccion_tablero(self._pag_tablero)
 
         self._pag_registro.grid(row=0, column=0, sticky="nsew")
+
+    # --- Ilustraciones difuminadas detrás de las tablas -----------------------
+
+    def _activar_fondo_tabla(self, tree: ttk.Treeview, clave: str, estilo_base: str) -> None:
+        """La tabla muestra la ilustración de su pestaña detrás de las filas (filas sin fondo propio)."""
+        if not FD.disponible(clave):
+            return
+        if not hasattr(self, "_fondos_tabla"):
+            self._fondos_tabla = {}
+        n = len(self._fondos_tabla) + 1
+        nombre, elemento = f"Fondo{n}.{estilo_base}", f"Fondo{n}.field"
+        foto = tk.PhotoImage(master=self, width=1, height=1)
+        style = ttk.Style(self)
+        try:
+            style.element_create(elemento, "image", foto, sticky="nsew")
+            style.layout(nombre, [(elemento, {"sticky": "nswe", "children": [
+                ("Treeview.padding", {"sticky": "nswe", "children": [("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        except tk.TclError:
+            return
+        tree.configure(style=nombre)
+        self._fondos_tabla[tree] = {"clave": clave, "foto": foto, "estilo": nombre, "tam": None, "job": None}
+        self._estilo_fondo_tabla(nombre)
+        tree.bind("<Configure>", lambda e, t=tree: self._programar_fondo_tabla(t), add="+")
+
+    def _estilo_fondo_tabla(self, nombre: str) -> None:
+        p = TTK_PALETTES[self._modo_actual]
+        style = ttk.Style(self)
+        style.configure(nombre, background="")  # filas transparentes: se ve la ilustración
+        style.map(nombre, background=[("selected", p["accent_indigo"])], foreground=[("selected", "#ffffff")])
+
+    def _programar_fondo_tabla(self, tree) -> None:
+        info = getattr(self, "_fondos_tabla", {}).get(tree)
+        if not info:
+            return
+        if info["job"] is not None:
+            self.after_cancel(info["job"])
+        info["job"] = self.after(120, lambda: self._dibujar_fondo_tabla(tree))
+
+    def _dibujar_fondo_tabla(self, tree, forzar: bool = False) -> None:
+        info = self._fondos_tabla.get(tree)
+        if not info:
+            return
+        info["job"] = None
+        try:
+            w, h = tree.winfo_width(), tree.winfo_height()
+            tam = (w, h, self._modo_actual)
+            if w < 40 or h < 40 or (tam == info["tam"] and not forzar):
+                return
+            p = TTK_PALETTES[self._modo_actual]
+            img = FD.componer_tabla(info["clave"], w, h, p["bg_card"], self._modo_actual)
+            if img is None:
+                return
+            from PIL import ImageTk
+            nueva = ImageTk.PhotoImage(img, master=self)
+            info["foto"].configure(width=w, height=h)
+            info["foto"].tk.call(info["foto"], "copy", nueva)
+            info["tam"] = tam
+        except Exception:
+            pass  # decorativo: nunca debe interrumpir la app
+
+    def _refrescar_fondos_tablas(self) -> None:
+        for tree, info in getattr(self, "_fondos_tabla", {}).items():
+            self._estilo_fondo_tabla(info["estilo"])
+            self._dibujar_fondo_tabla(tree, forzar=True)
+
+    def _bg_fila(self, tree, color: str) -> str:
+        """Color de fondo de las filas: transparente en las tablas con ilustración."""
+        return "" if tree in getattr(self, "_fondos_tabla", {}) else color
 
     def _cambiar_pagina(self, valor: str) -> None:
         self._pag_registro.grid_forget()
@@ -474,7 +551,7 @@ class BioGrowApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color=UI_COLORS["text_secondary"],
             anchor="w",
-        ).grid(row=0, column=0, columnspan=2, padx=(14, 8), pady=(10, 2), sticky="w")
+        ).grid(row=0, column=0, padx=(14, 6), pady=(10, 2), sticky="w")
 
         self._entry_lote = ctk.CTkEntry(
             frame,
@@ -485,7 +562,7 @@ class BioGrowApp(ctk.CTk):
             placeholder_text_color=UI_COLORS["text_muted"],
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
-        self._entry_lote.grid(row=1, column=0, columnspan=2, padx=(14, 8), pady=(0, 8), sticky="ew")
+        self._entry_lote.grid(row=1, column=0, padx=(14, 6), pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
             frame,
@@ -493,8 +570,9 @@ class BioGrowApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color=UI_COLORS["text_secondary"],
             anchor="w",
-        ).grid(row=0, column=2, padx=(8, 14), pady=(10, 2), sticky="w")
+        ).grid(row=0, column=1, columnspan=2, padx=(6, 14), pady=(10, 2), sticky="w")
 
+        # Ocupa dos columnas para que se lea el nombre técnico o científico completo
         self._combo_semilla = ctk.CTkComboBox(
             frame,
             values=TIPOS_SEMILLA,
@@ -510,9 +588,9 @@ class BioGrowApp(ctk.CTk):
             state="readonly",
         )
         self._combo_semilla.set(TIPOS_SEMILLA[0])
-        self._combo_semilla.grid(row=1, column=2, padx=(8, 14), pady=(0, 8), sticky="ew")
+        self._combo_semilla.grid(row=1, column=1, columnspan=2, padx=(6, 14), pady=(0, 8), sticky="ew")
 
-        # --- FILA 2 y 3: Fecha | Tiempo de Tratamiento | Temperatura (°C) ---
+        # --- FILA 2 y 3: Fecha | Tipo de tratamiento | Tiempo de tratamiento ---
         ctk.CTkLabel(
             frame,
             text="Fecha de Registro",
@@ -539,7 +617,7 @@ class BioGrowApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color=UI_COLORS["text_secondary"],
             anchor="w",
-        ).grid(row=2, column=1, padx=6, pady=(4, 2), sticky="w")
+        ).grid(row=2, column=2, padx=(6, 14), pady=(4, 2), sticky="w")
 
         self._entry_tratamiento = ctk.CTkEntry(
             frame,
@@ -550,27 +628,102 @@ class BioGrowApp(ctk.CTk):
             placeholder_text_color=UI_COLORS["text_muted"],
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
-        self._entry_tratamiento.grid(row=3, column=1, padx=6, pady=(0, 12), sticky="ew")
+        self._entry_tratamiento.grid(row=3, column=2, padx=(6, 14), pady=(0, 12), sticky="ew")
 
         ctk.CTkLabel(
             frame,
-            text="🌡️ Temperatura (°C)",
+            text="🌡️ Temperatura",
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color=UI_COLORS["text_secondary"],
             anchor="w",
-        ).grid(row=2, column=2, padx=(6, 14), pady=(4, 2), sticky="w")
+        ).grid(row=4, column=0, padx=(14, 6), pady=(0, 2), sticky="w")
 
+        # Campo abierto: número (35 -> 35 °C), rango o cualquier texto; vacío = Ambiente
         self._entry_temperatura = ctk.CTkEntry(
             frame,
-            placeholder_text="Ej: 35, 40.5 o Ambiente",
+            placeholder_text="Libre: 35, 35-40 °C… (vacío = Ambiente)",
             fg_color=UI_COLORS["input_bg"],
             border_color=UI_COLORS["border"],
             text_color=UI_COLORS["text_primary"],
             placeholder_text_color=UI_COLORS["text_muted"],
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
-        self._entry_temperatura.insert(0, "Ambiente")
-        self._entry_temperatura.grid(row=3, column=2, padx=(6, 14), pady=(0, 12), sticky="ew")
+        self._entry_temperatura.grid(row=5, column=0, padx=(14, 6), pady=(0, 12), sticky="ew")
+
+        # --- FILA 4 y 5: (Temperatura) | Tipo de gas | Flujo (L/min) ---
+        # --- FILA 6 y 7: Orientación | Morfología | Cantidad de semillas ---
+        def etiqueta(texto, fila, col):
+            ctk.CTkLabel(frame, text=texto, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                         text_color=UI_COLORS["text_secondary"], anchor="w").grid(
+                row=fila, column=col, padx=(14 if col == 0 else 6, 14 if col == 2 else 6), pady=(0, 2), sticky="w")
+
+        def combo(valores, fila, col):
+            c = ctk.CTkComboBox(
+                frame, values=valores, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"],
+                button_color=UI_COLORS["border"], button_hover_color=UI_COLORS["accent_green"],
+                dropdown_fg_color=UI_COLORS["bg_card"], dropdown_hover_color=UI_COLORS["bg_secondary"],
+                text_color=UI_COLORS["text_primary"], dropdown_text_color=UI_COLORS["text_primary"],
+                font=ctk.CTkFont(family="Segoe UI", size=12), state="readonly")
+            c.set(valores[0])
+            c.grid(row=fila, column=col, padx=(14 if col == 0 else 6, 14 if col == 2 else 6), pady=(0, 12), sticky="ew")
+            return c
+
+        def entrada(placeholder, fila, col, valor=""):
+            e = ctk.CTkEntry(frame, placeholder_text=placeholder, fg_color=UI_COLORS["input_bg"],
+                             border_color=UI_COLORS["border"], text_color=UI_COLORS["text_primary"],
+                             placeholder_text_color=UI_COLORS["text_muted"], font=ctk.CTkFont(family="Segoe UI", size=12))
+            if valor:
+                e.insert(0, valor)
+            e.grid(row=fila, column=col, padx=(14 if col == 0 else 6, 14 if col == 2 else 6), pady=(0, 12), sticky="ew")
+            return e
+
+        etiqueta("⚡ Tipo de tratamiento", 2, 1)
+        self._combo_tipo_trat = combo(TIPOS_TRATAMIENTO, 3, 1)
+        etiqueta("💨 Tipo de gas", 4, 1)
+        self._combo_gas = combo(TIPOS_GAS, 5, 1)
+        etiqueta("Flujo (L/min)", 4, 2)
+        self._entry_flujo = entrada("Ej: 2 (vacío = sin flujo)", 5, 2)
+        etiqueta("Orientación de la semilla", 6, 0)
+        self._combo_orientacion = combo(ORIENTACIONES, 7, 0)
+        etiqueta("Morfología de la semilla", 6, 1)
+        self._combo_morfologia = combo(MORFOLOGIAS, 7, 1)
+        etiqueta("Cantidad de semillas en el lote", 6, 2)
+        caja = ctk.CTkFrame(frame, fg_color="transparent")
+        caja.grid(row=7, column=2, padx=(6, 14), pady=(0, 12), sticky="ew")
+        caja.grid_columnconfigure(0, weight=1)
+        self._entry_cantidad = ctk.CTkEntry(caja, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"],
+                                            text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(family="Segoe UI", size=12))
+        self._entry_cantidad.insert(0, str(NUM_MUESTRAS))
+        self._entry_cantidad.grid(row=0, column=0, sticky="ew")
+        self._entry_cantidad.bind("<Return>", lambda e: self._aplicar_cantidad_semillas())
+        ctk.CTkButton(caja, text="Aplicar", width=64, fg_color=UI_COLORS["accent_indigo"], text_color="#ffffff",
+                      font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._aplicar_cantidad_semillas).grid(row=0, column=1, padx=(6, 0))
+
+    def _aplicar_cantidad_semillas(self) -> None:
+        """Cambia el número de filas de la tabla de captura conservando lo ya capturado."""
+        if not self._cerrar_entry_activo(guardar=True):
+            return
+        ok, n, msg = validar_cantidad_semillas(self._entry_cantidad.get())
+        if not ok:
+            messagebox.showerror("Cantidad inválida", msg, parent=self)
+            return
+        if n == self._num_muestras:
+            return
+        perdidas = [i + 1 for i, f in enumerate(self._filas_captura[n:], start=n)
+                    if any(f[k] is not None for k in ("raiz", "tallo", "hojas"))]
+        if perdidas and not messagebox.askyesno(
+                "Reducir la tabla",
+                f"Las muestras {perdidas[0]} a {perdidas[-1]} ya tienen datos y se borrarán. ¿Continuar?", parent=self):
+            self._entry_cantidad.delete(0, tk.END)
+            self._entry_cantidad.insert(0, str(self._num_muestras))
+            return
+        previas = self._filas_captura[:n]
+        self._num_muestras = n
+        self._inicializar_tabla_captura()
+        for i, f in enumerate(previas):
+            self._filas_captura[i] = f
+            self._actualizar_fila_estado(i)
 
     def _construir_campo(self, padre, etiqueta: str, fila: int, col: int, placeholder: str = "", valor_inicial: str = "") -> None:
         ctk.CTkLabel(
@@ -601,13 +754,14 @@ class BioGrowApp(ctk.CTk):
         contenedor_tabla.grid_columnconfigure(0, weight=1)
         contenedor_tabla.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(
+        self._lbl_tabla_captura = ctk.CTkLabel(
             contenedor_tabla,
-            text="📊  Tabla de Captura — 27 Muestras (Doble clic o Enter para editar)",
+            text=f"📊  Tabla de Captura — {self._num_muestras} Muestras (Doble clic o Enter para editar)",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             text_color=UI_COLORS["text_secondary"],
             anchor="w",
-        ).grid(row=0, column=0, pady=(0, 4), sticky="w")
+        )
+        self._lbl_tabla_captura.grid(row=0, column=0, pady=(0, 4), sticky="w")
 
         tabla_frame = ctk.CTkFrame(
             contenedor_tabla,
@@ -626,7 +780,7 @@ class BioGrowApp(ctk.CTk):
             columns=columnas,
             show="headings",
             style="Captura.Treeview",
-            height=18,
+            height=12,
             selectmode="browse",
         )
 
@@ -666,13 +820,16 @@ class BioGrowApp(ctk.CTk):
         for item in self._tree_captura.get_children():
             self._tree_captura.delete(item)
 
-        for i in range(1, NUM_MUESTRAS + 1):
+        if hasattr(self, "_lbl_tabla_captura"):
+            self._lbl_tabla_captura.configure(
+                text=f"📊  Tabla de Captura — {self._num_muestras} Muestras (Doble clic o Enter para editar)")
+        for i in range(1, self._num_muestras + 1):
             self._filas_captura.append({"raiz": None, "tallo": None, "hojas": None})
             tag = "row_alt" if i % 2 == 0 else "row_norm"
             self._tree_captura.insert("", "end", iid=str(i), values=(i, "", "", "", ""), tags=(tag,))
 
     def _refrescar_colores_captura(self) -> None:
-        for idx in range(NUM_MUESTRAS):
+        for idx in range(self._num_muestras):
             self._actualizar_fila_estado(idx)
 
     def _actualizar_fila_estado(self, fila_idx: int) -> None:
@@ -733,7 +890,7 @@ class BioGrowApp(ctk.CTk):
             if not self._cerrar_entry_activo(guardar=True):
                 return
             siguiente = fila_idx + 1
-            if siguiente < NUM_MUESTRAS:
+            if siguiente < self._num_muestras:
                 nuevo_iid = str(siguiente + 1)
                 self._tree_captura.selection_set(nuevo_iid)
                 self._tree_captura.see(nuevo_iid)
@@ -754,7 +911,7 @@ class BioGrowApp(ctk.CTk):
 
         if event.keysym == "Up" and fila_idx > 0:
             nueva_fila = fila_idx - 1
-        elif event.keysym == "Down" and fila_idx < NUM_MUESTRAS - 1:
+        elif event.keysym == "Down" and fila_idx < self._num_muestras - 1:
             nueva_fila = fila_idx + 1
         elif event.keysym == "Left" and col_actual > 2:
             nueva_col = col_actual - 1
@@ -880,7 +1037,7 @@ class BioGrowApp(ctk.CTk):
             nueva_col = 2
             nueva_fila = fila_idx + 1
 
-        if nueva_fila < NUM_MUESTRAS:
+        if nueva_fila < self._num_muestras:
             nuevo_iid = str(nueva_fila + 1)
             self._tree_captura.selection_set(nuevo_iid)
             self._tree_captura.see(nuevo_iid)
@@ -921,6 +1078,16 @@ class BioGrowApp(ctk.CTk):
             messagebox.showerror("Temperatura inválida", msg_temp, parent=self)
             return
 
+        ok_flujo, flujo, msg_flujo = validar_flujo(self._entry_flujo.get())
+        if not ok_flujo:
+            messagebox.showerror("Flujo inválido", msg_flujo, parent=self)
+            return
+        gas = self._combo_gas.get()
+        if gas == "Sin gas" and flujo:
+            if not messagebox.askyesno("Revisa el gas", "Pusiste un flujo pero el gas es 'Sin gas'. ¿Guardar así?",
+                                       parent=self):
+                return
+
         mediciones = []
         for i, fila in enumerate(self._filas_captura, start=1):
             raiz, tallo, hojas = fila["raiz"], fila["tallo"], fila["hojas"]
@@ -951,7 +1118,13 @@ class BioGrowApp(ctk.CTk):
             tiempo_tratamiento=tiempo_trat,
             temperatura=temp_fmt,
             mediciones=mediciones,
-     )
+            gas=gas,
+            flujo=flujo,
+            orientacion=self._combo_orientacion.get(),
+            morfologia=self._combo_morfologia.get(),
+            cantidad_semillas=self._num_muestras,
+            tipo_tratamiento=self._combo_tipo_trat.get(),
+        )
 
         self._btn_guardar.configure(state="disabled", text="⏳   Guardando...")
         exito, mensaje = self.db.guardar_lote(datos)
@@ -971,7 +1144,7 @@ class BioGrowApp(ctk.CTk):
         self._entry_fecha.insert(0, formatear_fecha_actual())
         self._entry_tratamiento.delete(0, tk.END)
         self._entry_temperatura.delete(0, tk.END)
-        self._entry_temperatura.insert(0, "Ambiente")
+        # Tipo de tratamiento, gas, flujo, orientación, morfología y cantidad se conservan: suelen repetirse entre lotes.
         self._inicializar_tabla_captura()
 
     # -----------------------------------------------------------------------
@@ -1113,6 +1286,14 @@ class BioGrowApp(ctk.CTk):
             width=170
         ).pack(side="right", padx=4)
 
+        ctk.CTkButton(
+            fecha_frame, text="📥 Importar",
+            fg_color=UI_COLORS["accent_green"], hover_color=UI_COLORS["accent_hover"],
+            text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._importar_excel_desde_historial,
+            width=95
+        ).pack(side="right", padx=4)
+
     def _abrir_calendario_modal(self, variable_destino: tk.StringVar) -> None:
         """Abre una ventana emergente nativa con selectores de Fecha (Año, Mes, Día)."""
         top_cal = ctk.CTkToplevel(self)
@@ -1216,12 +1397,10 @@ class BioGrowApp(ctk.CTk):
         ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
         # Inicializar conjuntos de selección múltiple con todas las opciones por defecto
-        if not hasattr(self, "_sel_variedades"):
-            self._sel_variedades = set(TIPOS_SEMILLA)
-        if not hasattr(self, "_sel_tratamientos"):
-            self._sel_tratamientos = {"Control", "30s", "45s", "60s"}
-        if not hasattr(self, "_sel_germino"):
-            self._sel_germino = {"1", "0"}
+        # None = sin filtro (se muestran todos, también variedades o tiempos fuera de la lista)
+        for atributo in ("_sel_variedades", "_sel_tratamientos", "_sel_germino"):
+            if not hasattr(self, atributo):
+                setattr(self, atributo, None)
 
         # 2. Botón desplegable para Variedades (Pasando TIPOS_SEMILLA completos)
         ctk.CTkButton(
@@ -1229,7 +1408,7 @@ class BioGrowApp(ctk.CTk):
             fg_color=UI_COLORS["input_bg"], hover_color=UI_COLORS["border"],
             border_width=1, border_color=UI_COLORS["border"],
             text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(size=11, weight="bold"),
-            command=lambda: self._abrir_selector_multiple("Variedades", self._sel_variedades, TIPOS_SEMILLA)
+            command=lambda: self._abrir_selector_multiple("Variedades", "_sel_variedades", self._opciones_variedades())
         ).grid(row=0, column=1, padx=(0, 6), sticky="ew")
 
         # 3. Botón desplegable para Tratamientos (Pasando la lista completa de tratamientos)
@@ -1238,7 +1417,7 @@ class BioGrowApp(ctk.CTk):
             fg_color=UI_COLORS["input_bg"], hover_color=UI_COLORS["border"],
             border_width=1, border_color=UI_COLORS["border"],
             text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(size=11, weight="bold"),
-            command=lambda: self._abrir_selector_multiple("Tratamientos", self._sel_tratamientos, ["Control", "30s", "45s", "60s"])
+            command=lambda: self._abrir_selector_multiple("Tratamientos", "_sel_tratamientos", self._opciones_tratamientos())
         ).grid(row=0, column=2, padx=(0, 6), sticky="ew")
 
         # 4. Botón desplegable para Estado de Germinación
@@ -1247,7 +1426,7 @@ class BioGrowApp(ctk.CTk):
             fg_color=UI_COLORS["input_bg"], hover_color=UI_COLORS["border"],
             border_width=1, border_color=UI_COLORS["border"],
             text_color=UI_COLORS["text_primary"], font=ctk.CTkFont(size=11, weight="bold"),
-            command=lambda: self._abrir_selector_multiple("Germinación", self._sel_germino, [("1", "Germinó"), ("0", "No germinó")])
+            command=lambda: self._abrir_selector_multiple("Germinación", "_sel_germino", [("1", "Germinó"), ("0", "No germinó")])
         ).grid(row=0, column=3, padx=(0, 8), sticky="ew")
 
         # 5. Contador de registros
@@ -1260,81 +1439,42 @@ class BioGrowApp(ctk.CTk):
         )
         self._lbl_total.grid(row=0, column=4, sticky="e")
 
-    def _abrir_ventana_graficos_historial(self) -> None:
-        """Abre una nueva ventana modal con múltiples gráficas basadas en el historial filtrado actual."""
-        if not self._datos_historial_actual:
-            messagebox.showwarning("Sin datos", "No hay registros en el historial con los filtros actuales para graficar.", parent=self)
-            return
+    @staticmethod
+    def _tratamiento_normalizado(texto) -> str:
+        """'45', '45 s', '45 seg' -> '45s'; '2 min' -> '120s'; 'control' -> 'Control'; lo demás tal cual."""
+        t = str(texto or "").strip()
+        if not t or "control" in t.lower() or t in ("0", "0s"):
+            return "Control" if t else "Sin definir"
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(s|seg|segs|segundos?|min|mins|minutos?)?", t, re.IGNORECASE)
+        if not m:
+            return t
+        v = float(m.group(1).replace(",", "."))
+        if (m.group(2) or "").lower().startswith("min"):
+            v *= 60
+        return f"{v:g}s"
 
-        # Convertir la lista actual del historial filtrado en DataFrame
-        df_base = pd.DataFrame(self._datos_historial_actual)
-        
-        # Normalizar nombres de columnas para que coincidan con las gráficas
-        if "tiempo_tratamiento" in df_base.columns and "Tratamiento" not in df_base.columns:
-            df_base["Tratamiento"] = df_base["tiempo_tratamiento"]
-        if "longitud_raiz" in df_base.columns and "Raíz (mm)" not in df_base.columns:
-            df_base["Raíz (mm)"] = pd.to_numeric(df_base["longitud_raiz"], errors="coerce")
-        if "longitud_tallo" in df_base.columns and "Tallo (mm)" not in df_base.columns:
-            df_base["Tallo (mm)"] = pd.to_numeric(df_base["longitud_tallo"], errors="coerce")
-        if "germino" in df_base.columns and "Estado" not in df_base.columns:
-            df_base["Estado"] = df_base["germino"].apply(lambda x: "Germinó" if int(x) == 1 else "No germinó")
+    def _opciones_variedades(self) -> list:
+        """Variedades del catálogo más las que aparezcan en la base con otro nombre."""
+        opciones = {AN.clave_variedad(t): t for t in TIPOS_SEMILLA}
+        for row in getattr(self, "_historial_crudo", []):
+            opciones.setdefault(AN.clave_variedad(row.get("tipo_semilla")), str(row.get("tipo_semilla") or "Sin especificar"))
+        return list(opciones.items())
 
-        if df_base.empty:
-            return
+    def _opciones_tratamientos(self) -> list:
+        vals = set(TRATAMIENTOS_BASE) | {self._tratamiento_normalizado(r.get("tiempo_tratamiento"))
+                                         for r in getattr(self, "_historial_crudo", [])}
+        def orden(t):
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)s", t)
+            return (0, 0, t) if t == "Control" else ((1, float(m.group(1)), t) if m else (2, 0, t))
+        return sorted(vals, key=orden)
 
-        # Crear ventana nueva (CTkToplevel)
-        ventana_graf = ctk.CTkToplevel(self)
-        ventana_graf.title("📊 Análisis Gráfico del Historial Filtrado — BioGrow")
-        ventana_graf.geometry("1100x700")
-        ventana_graf.grab_set()
-
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-        p = TTK_PALETTES[self._modo_actual]
-        fig = Figure(figsize=(10.5, 6.5), dpi=110, facecolor=p["bg_card"])
-        fig.subplots_adjust(hspace=0.35, wspace=0.25, bottom=0.10, top=0.90, left=0.08, right=0.95)
-
-        # Gráfico 1: Raíz por Tratamiento
-        ax1 = fig.add_subplot(221)
-        ax1.set_title("Promedio de Raíz (mm) por Tratamiento", color=p["text_primary"], fontsize=10, fontweight="bold")
-        if "Tratamiento" in df_base.columns and "Raíz (mm)" in df_base.columns:
-            df_base.groupby("Tratamiento")["Raíz (mm)"].mean().plot(kind="bar", ax=ax1, color="#2a78d6", alpha=0.85)
-        ax1.tick_params(colors=p["text_primary"], labelsize=8)
-
-        # Gráfico 2: Tallo por Tratamiento
-        ax2 = fig.add_subplot(222)
-        ax2.set_title("Promedio de Tallo (mm) por Tratamiento", color=p["text_primary"], fontsize=10, fontweight="bold")
-        if "Tratamiento" in df_base.columns and "Tallo (mm)" in df_base.columns:
-            df_base.groupby("Tratamiento")["Tallo (mm)"].mean().plot(kind="bar", ax=ax2, color="#10b981", alpha=0.85)
-        ax2.tick_params(colors=p["text_primary"], labelsize=8)
-
-        # Gráfico 3: Porcentaje de Germinación
-        ax3 = fig.add_subplot(223)
-        ax3.set_title("Porcentaje de Germinación (%)", color=p["text_primary"], fontsize=10, fontweight="bold")
-        if "Tratamiento" in df_base.columns and "Estado" in df_base.columns:
-            germ_s = df_base.groupby("Tratamiento")["Estado"].apply(lambda x: (x.str.lower().str.contains("germinó|germino|1|true")).mean() * 100)
-            germ_s.plot(kind="bar", ax=ax3, color="#f59e0b", alpha=0.85)
-        ax3.tick_params(colors=p["text_primary"], labelsize=8)
-
-        # Gráfico 4: Dispersión Alométrica
-        ax4 = fig.add_subplot(224)
-        ax4.set_title("Correlación Raíz vs Tallo", color=p["text_primary"], fontsize=10, fontweight="bold")
-        if "Raíz (mm)" in df_base.columns and "Tallo (mm)" in df_base.columns:
-            ax4.scatter(df_base["Raíz (mm)"], df_base["Tallo (mm)"], alpha=0.6, color="#6366f1", s=25)
-            ax4.set_xlabel("Raíz (mm)", color=p["text_primary"], fontsize=9)
-            ax4.set_ylabel("Tallo (mm)", color=p["text_primary"], fontsize=9)
-        ax4.tick_params(colors=p["text_primary"], labelsize=8)
-
-        canvas = FigureCanvasTkAgg(fig, master=ventana_graf)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True, padx=15, pady=15)
-
-    def _abrir_selector_multiple(self, titulo: str, conjunto_ref: set, opciones_disponibles: list) -> None:
-        """Ventana modal con Checkboxes para selección múltiple de filtros."""
+    def _abrir_selector_multiple(self, titulo: str, atributo: str, opciones_disponibles: list) -> None:
+        """Ventana modal con Checkboxes para selección múltiple de filtros.
+        La selección se guarda en el atributo indicado; si quedan todas marcadas, se guarda None (sin filtro)."""
+        conjunto_ref = getattr(self, atributo, None)
         top = ctk.CTkToplevel(self)
         top.title(f"Seleccionar {titulo}")
-        top.geometry("340x380")
+        top.geometry("440x400")
         top.grab_set()
 
         ctk.CTkLabel(
@@ -1350,17 +1490,15 @@ class BioGrowApp(ctk.CTk):
             val_key = op[0] if isinstance(op, tuple) else op
             val_lbl = op[1] if isinstance(op, tuple) else op
             
-            var = tk.BooleanVar(value=(val_key in conjunto_ref))
+            var = tk.BooleanVar(value=(conjunto_ref is None or val_key in conjunto_ref))
             vars_dict[val_key] = var
             
             chk = ctk.CTkCheckBox(frame_chk, text=val_lbl, variable=var)
             chk.pack(anchor="w", pady=4, padx=5)
 
         def aplicar_seleccion():
-            conjunto_ref.clear()
-            for k, v in vars_dict.items():
-                if v.get():
-                    conjunto_ref.add(str(k))
+            elegidos = {str(k) for k, v in vars_dict.items() if v.get()}
+            setattr(self, atributo, None if len(elegidos) == len(vars_dict) else elegidos)
             top.destroy()
             self._cargar_historial()
 
@@ -1383,7 +1521,8 @@ class BioGrowApp(ctk.CTk):
         tree_frame.grid_columnconfigure(0, weight=1)
         tree_frame.grid_rowconfigure(0, weight=1)
 
-        columnas = ("fecha", "lote", "semilla", "muestra", "tratamiento", "temperatura", "hojas", "raiz", "tallo", "resultado")
+        columnas = ("fecha", "lote", "semilla", "muestra", "tipo_trat", "tratamiento", "temperatura", "gas", "flujo",
+                    "orientacion", "morfologia", "hojas", "raiz", "tallo", "resultado")
         
         self._tree_historial = ttk.Treeview(
             tree_frame,
@@ -1397,10 +1536,15 @@ class BioGrowApp(ctk.CTk):
         encabezados = {
             "fecha":       ("Fecha",          110, "center"),
             "lote":        ("Lote Origen",    120, "w"),
-            "semilla":     ("Tipo Semilla",   130, "center"),
+            "semilla":     ("Tipo Semilla",   240, "w"),  # cabe el nombre técnico o científico
             "muestra":     ("No.",             42, "center"),
+            "tipo_trat":   ("Tipo trat.",      80, "center"),
             "tratamiento": ("Tratamiento",     85, "center"),
-            "temperatura": ("Temp. (°C)",      80, "center"),
+            "temperatura": ("Temperatura",     90, "center"),
+            "gas":         ("Gas",             72, "center"),
+            "flujo":       ("Flujo (L/min)",   80, "center"),
+            "orientacion": ("Orientación",     82, "center"),
+            "morfologia":  ("Morfología",      72, "center"),
             "hojas":       ("Cant. Hojas",     75, "center"),
             "raiz":        ("Raíz (mm)",       72, "center"),
             "tallo":       ("Tallo (mm)",      72, "center"),
@@ -1419,6 +1563,7 @@ class BioGrowApp(ctk.CTk):
         vsb.grid(row=0, column=1, sticky="ns", pady=(2, 0))
         hsb.grid(row=1, column=0, sticky="ew", padx=(2, 0))
 
+        self._activar_fondo_tabla(self._tree_historial, "registro", "BioGrow.Treeview")
         self._aplicar_estilos_ttk()
 
         # Menú contextual de clic derecho (Edición y Eliminación)
@@ -1463,7 +1608,7 @@ class BioGrowApp(ctk.CTk):
         modal = ctk.CTkToplevel(self)
         modal.title(f"Editar Muestra #{reg['num_muestra']} — {reg['nombre_lote']}")
         modal.configure(fg_color=UI_COLORS["bg_primary"])
-        centrar_ventana(modal, 460, 480)
+        centrar_ventana(modal, 520, 720)
         modal.transient(self)
         modal.grab_set()
 
@@ -1486,11 +1631,14 @@ class BioGrowApp(ctk.CTk):
 
         # Variedad
         ctk.CTkLabel(card, text="Variedad de Semilla:", font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["text_secondary"]).grid(row=3, column=0, padx=20, sticky="w")
+        actual_sem = next((t for t in TIPOS_SEMILLA if AN.clave_variedad(t) == AN.clave_variedad(reg["tipo_semilla"])),
+                          str(reg["tipo_semilla"] or TIPOS_SEMILLA[0]))
+        valores_sem = TIPOS_SEMILLA if actual_sem in TIPOS_SEMILLA else TIPOS_SEMILLA + [actual_sem]
         cmb_sem = ctk.CTkComboBox(
-            card, values=TIPOS_SEMILLA, state="readonly",
+            card, values=valores_sem, state="readonly",
             fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"], text_color=UI_COLORS["text_primary"]
         )
-        cmb_sem.set(reg["tipo_semilla"] if reg["tipo_semilla"] in TIPOS_SEMILLA else TIPOS_SEMILLA[0])
+        cmb_sem.set(actual_sem)
         cmb_sem.grid(row=4, column=0, padx=20, pady=(2, 10), sticky="ew")
 
         # Tratamiento
@@ -1498,6 +1646,41 @@ class BioGrowApp(ctk.CTk):
         ent_trat = ctk.CTkEntry(card, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"], text_color=UI_COLORS["text_primary"])
         ent_trat.insert(0, reg["tiempo_tratamiento"])
         ent_trat.grid(row=6, column=0, padx=20, pady=(2, 10), sticky="ew")
+
+        # Factores del tratamiento (se aplican a todo el lote)
+        fac = ctk.CTkFrame(card, fg_color="transparent")
+        fac.grid(row=9, column=0, padx=20, pady=(0, 6), sticky="ew")
+        fac.grid_columnconfigure((0, 1), weight=1)
+        def _lbl(t, r, c):
+            ctk.CTkLabel(fac, text=t, font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=UI_COLORS["text_secondary"]).grid(row=r, column=c, sticky="w", padx=(0 if c == 0 else 6, 0))
+        def _cmb(vals, actual, r, c):
+            cb = ctk.CTkComboBox(fac, values=vals, state="readonly", fg_color=UI_COLORS["input_bg"],
+                                 border_color=UI_COLORS["border"], text_color=UI_COLORS["text_primary"])
+            cb.set(actual if actual in vals else vals[0])
+            cb.grid(row=r, column=c, padx=(0 if c == 0 else 6, 0), pady=(2, 8), sticky="ew")
+            return cb
+        _lbl("Tipo de gas", 0, 0)
+        cmb_gas = _cmb(TIPOS_GAS, reg.get("gas"), 1, 0)
+        _lbl("Flujo (L/min)", 0, 1)
+        ent_flujo = ctk.CTkEntry(fac, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"],
+                                 text_color=UI_COLORS["text_primary"])
+        if reg.get("flujo") is not None:
+            ent_flujo.insert(0, f"{float(reg['flujo']):g}")
+        ent_flujo.grid(row=1, column=1, padx=(6, 0), pady=(2, 8), sticky="ew")
+        _lbl("Orientación", 2, 0)
+        cmb_ori = _cmb(ORIENTACIONES, reg.get("orientacion"), 3, 0)
+        _lbl("Morfología", 2, 1)
+        cmb_mor = _cmb(MORFOLOGIAS, reg.get("morfologia"), 3, 1)
+        _lbl("Tipo de tratamiento", 4, 0)
+        cmb_tipo = _cmb(TIPOS_TRATAMIENTO, reg.get("tipo_tratamiento") or "Plasma", 5, 0)
+        _lbl("Temperatura (libre)", 4, 1)
+        ent_temp = ctk.CTkEntry(fac, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"],
+                                text_color=UI_COLORS["text_primary"])
+        ent_temp.insert(0, str(reg.get("temperatura") or "Ambiente"))
+        ent_temp.grid(row=5, column=1, padx=(6, 0), pady=(2, 8), sticky="ew")
+        ctk.CTkLabel(card, text="Tipo de tratamiento, temperatura, gas, flujo, orientación y morfología cambian en todo el lote.",
+                     font=ctk.CTkFont(size=10), text_color=UI_COLORS["text_muted"]).grid(row=8, column=0, padx=20, sticky="w")
 
         # Medidas biométricas en fila
         med_frame = ctk.CTkFrame(card, fg_color="transparent")
@@ -1536,7 +1719,17 @@ class BioGrowApp(ctk.CTk):
                 messagebox.showerror("Error", "La cantidad de hojas debe ser un entero >= 0.", parent=modal)
                 return
 
+            ok_f, val_f, msg_f = validar_flujo(ent_flujo.get())
+            if not ok_f:
+                messagebox.showerror("Error", msg_f, parent=modal)
+                return
+            ok_tp, val_tp, msg_tp = validar_temperatura(ent_temp.get())
+            if not ok_tp:
+                messagebox.showerror("Error", msg_tp, parent=modal)
+                return
             exito, msg = self.db.actualizar_medicion(
+                gas=cmb_gas.get(), flujo=val_f, orientacion=cmb_ori.get(), morfologia=cmb_mor.get(),
+                temperatura=val_tp, tipo_tratamiento=cmb_tipo.get(),
                 medicion_id=reg["medicion_id"],
                 experimento_id=reg["experimento_id"],
                 nombre_lote=ent_lote.get().strip(),
@@ -1554,7 +1747,7 @@ class BioGrowApp(ctk.CTk):
                 messagebox.showerror("Error", msg, parent=modal)
 
         btn_box = ctk.CTkFrame(card, fg_color="transparent")
-        btn_box.grid(row=8, column=0, padx=20, pady=(10, 16), sticky="ew")
+        btn_box.grid(row=10, column=0, padx=20, pady=(10, 16), sticky="ew")
         btn_box.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkButton(
@@ -1616,6 +1809,7 @@ class BioGrowApp(ctk.CTk):
             filtro_semilla="",
             filtro_germino="",
         )
+        self._historial_crudo = datos
 
         # Filtrar por rango de fechas (Desde / Hasta)
         f_desde = self._var_hist_desde.get() if hasattr(self, "_var_hist_desde") else "Todas"
@@ -1629,16 +1823,19 @@ class BioGrowApp(ctk.CTk):
             if f_hasta != "Todas" and fecha_reg > f_hasta:
                 continue
 
-            # Filtrar por Variedad múltiple
-            if hasattr(self, "_sel_variedades") and row["tipo_semilla"] not in self._sel_variedades:
+            # Filtrar por Variedad múltiple (sin importar el nombre técnico entre paréntesis)
+            sel = getattr(self, "_sel_variedades", None)
+            if sel is not None and AN.clave_variedad(row["tipo_semilla"]) not in sel:
                 continue
 
-            # Filtrar por Tratamiento múltiple
-            if hasattr(self, "_sel_tratamientos") and row["tiempo_tratamiento"] not in self._sel_tratamientos:
+            # Filtrar por Tratamiento múltiple (45, 45 s y 45s cuentan como el mismo)
+            sel = getattr(self, "_sel_tratamientos", None)
+            if sel is not None and self._tratamiento_normalizado(row["tiempo_tratamiento"]) not in sel:
                 continue
 
             # Filtrar por Germinación múltiple
-            if hasattr(self, "_sel_germino") and str(row["germino"]) not in self._sel_germino:
+            sel = getattr(self, "_sel_germino", None)
+            if sel is not None and str(row["germino"]) not in sel:
                 continue
 
             self._datos_historial_actual.append(row)
@@ -1666,8 +1863,13 @@ class BioGrowApp(ctk.CTk):
                     truncar_texto(row["nombre_lote"], 22),
                     row["tipo_semilla"],
                     row["num_muestra"],
+                    row.get("tipo_tratamiento") or "Plasma",
                     row["tiempo_tratamiento"],
                     row.get("temperatura", "Ambiente"),
+                    row.get("gas") or "Sin gas",  # lotes anteriores a estos campos: valores por defecto
+                    "" if row.get("flujo") is None else f"{float(row['flujo']):g}",
+                    row.get("orientacion") or "Aleatorio",
+                    row.get("morfologia") or "Plana",
                     hojas_txt,
                     f"{float(row['longitud_raiz']):.2f}",
                     f"{float(row['longitud_tallo']):.2f}",
@@ -1696,94 +1898,12 @@ class BioGrowApp(ctk.CTk):
         )
         if not ruta:
             return
-
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Historial Biométrico"
-
-            # Título del reporte
-            ws.merge_cells("A1:H1")
-            ws["A1"] = "BIOGROW ANALYTICS — REPORTE DE GERMINACIÓN Y BIOMETRÍA DE SEMILLAS"
-            ws["A1"].font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
-            ws["A1"].fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
-            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-            ws.row_dimensions[1].height = 28
-
-            # Subtítulo con fecha y resumen
-            total = len(self._datos_historial_actual)
-            germ = sum(1 for r in self._datos_historial_actual if int(r["germino"]) == 1)
-            pct = (germ / total * 100) if total > 0 else 0
-            ws.merge_cells("A2:H2")
-            ws["A2"] = f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Total Muestras: {total}   |   Germinadas: {germ} ({pct:.1f}%)"
-            ws["A2"].font = Font(name="Calibri", size=10, italic=True, color="334155")
-            ws["A2"].fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
-            ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
-            ws.row_dimensions[2].height = 20
-
-            # Encabezados de tabla
-            headers = ["Lote Origen", "Variedad de Semilla", "No. Muestra", "Tratamiento", "Cant. Hojas", "Raíz (mm)", "Tallo (mm)", "Estado"]
-            ws.append([])
-            ws.append(headers)
-            ws.row_dimensions[4].height = 24
-
-            header_fill = PatternFill(start_color="059669", end_color="059669", fill_type="solid")
-            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-            thin_border = Border(
-                left=Side(style="thin", color="CBD5E1"),
-                right=Side(style="thin", color="CBD5E1"),
-                top=Side(style="thin", color="CBD5E1"),
-                bottom=Side(style="thin", color="CBD5E1"),
-            )
-
-            for col_num in range(1, 9):
-                c = ws.cell(row=4, column=col_num)
-                c.fill = header_fill
-                c.font = header_font
-                c.alignment = Alignment(horizontal="center", vertical="center")
-                c.border = thin_border
-
-            alt_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-            si_font  = Font(name="Calibri", size=10, bold=True, color="059669")
-            no_font  = Font(name="Calibri", size=10, bold=True, color="DC2626")
-            reg_font = Font(name="Calibri", size=10, color="0F172A")
-
-            for idx, r in enumerate(self._datos_historial_actual, start=5):
-                estado = "Germinó" if int(r["germino"]) == 1 else "No germinó"
-                fila = [
-                    r["nombre_lote"],
-                    r["tipo_semilla"],
-                    int(r["num_muestra"]),
-                    r["tiempo_tratamiento"],
-                    int(r["cantidad_hojas"]) if r["cantidad_hojas"] is not None else 0,
-                    float(r["longitud_raiz"]),
-                    float(r["longitud_tallo"]),
-                    estado,
-                ]
-                ws.append(fila)
-                ws.row_dimensions[idx].height = 20
-
-                for col_num in range(1, 9):
-                    celda = ws.cell(row=idx, column=col_num)
-                    celda.border = thin_border
-                    if idx % 2 == 1:
-                        celda.fill = alt_fill
-                    celda.alignment = Alignment(horizontal="left" if col_num in (1, 2) else "center", vertical="center")
-                    if col_num in (6, 7):
-                        celda.number_format = "0.00"
-                    if col_num == 8:
-                        celda.font = si_font if int(r["germino"]) == 1 else no_font
-                    else:
-                        celda.font = reg_font
-
-            anchos = [24, 28, 14, 18, 14, 14, 14, 16]
-            for i, ancho in enumerate(anchos, start=1):
-                ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = ancho
-
-            wb.save(ruta)
+            # Mismo formato que la plantilla (machote): el archivo se puede volver a cargar o importar.
+            contenido = AN.excel_machote(self._datos_historial_actual,
+                                         titulo="BIOGROW ANALYTICS — REPORTE DE GERMINACIÓN Y BIOMETRÍA DE SEMILLAS")
+            with open(ruta, "wb") as f:
+                f.write(contenido)
             messagebox.showinfo("✅ Exportación Exitosa", f"Archivo Excel guardado correctamente en:\n{ruta}", parent=self)
         except ImportError:
             messagebox.showerror("Librería faltante", "Instala openpyxl ejecutando en tu terminal:\npip install openpyxl", parent=self)
@@ -1904,6 +2024,10 @@ class BioGrowApp(ctk.CTk):
 
         # Convertir la lista actual del historial filtrado en DataFrame
         df_base = pd.DataFrame(self._datos_historial_actual)
+        # Variedades con y sin nombre científico, y tiempos escritos distinto (45, 45 s), cuentan como uno
+        df_base["tipo_semilla"] = df_base["tipo_semilla"].map(
+            lambda v: next((t for t in TIPOS_SEMILLA if AN.clave_variedad(t) == AN.clave_variedad(v)), v))
+        df_base["tiempo_tratamiento"] = df_base["tiempo_tratamiento"].map(self._tratamiento_normalizado)
         
         # Normalizar nombres de columnas para que coincidan con las gráficas
         if "tiempo_tratamiento" in df_base.columns and "Tratamiento" not in df_base.columns:
@@ -1990,7 +2114,8 @@ class BioGrowApp(ctk.CTk):
             self.configure(cursor="")
         n_arch = len(self._archivos_excel_cargados)
         n_filas = len(self._df_excel_cache)
-        self._lbl_estado_excel.configure(text=f"📂 {n_arch} Excel ({n_filas} semillas)")
+        self._actualizar_estado_excel()
+        self._guardar_config_excel()
         if not self._df_excel_cache.empty and self._var_fuente_datos.get() == "Solo MySQL":
             self._var_fuente_datos.set("MySQL + Excel (Combinados)")
         self._unidad_tocada = False
@@ -2005,10 +2130,147 @@ class BioGrowApp(ctk.CTk):
         self._archivos_excel_cargados.clear()
         self._df_excel_cache = pd.DataFrame()
         self._advertencias_excel = []
-        self._lbl_estado_excel.configure(text="📂 0 Excel cargados")
+        self._actualizar_estado_excel()
+        self._guardar_config_excel()
         self._var_fuente_datos.set("Solo MySQL")
         self._unidad_tocada = False
         self._ejecutar_analisis_ui()
+
+    # --- Recordar los Excel cargados entre sesiones -------------------------
+
+    def _ruta_config_excel(self) -> str:
+        carpeta = os.path.dirname(os.path.abspath(self.db.db_path))
+        return os.path.join(carpeta, "biogrow_excels.json")
+
+    def _leer_config_excel(self) -> dict:
+        try:
+            with open(self._ruta_config_excel(), encoding="utf-8") as f:
+                datos = json.load(f)
+            return datos if isinstance(datos, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _guardar_config_excel(self) -> None:
+        recordar = self._var_recordar_excel.get() if hasattr(self, "_var_recordar_excel") else True
+        datos = {"recordar": recordar, "archivos": list(self._archivos_excel_cargados) if recordar else []}
+        try:
+            with open(self._ruta_config_excel(), "w", encoding="utf-8") as f:
+                json.dump(datos, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass  # no poder recordar los archivos no debe impedir usar la app
+
+    def _actualizar_estado_excel(self, faltantes: int = 0) -> None:
+        n = len(self._archivos_excel_cargados)
+        texto = f"📂 {n} Excel ({len(self._df_excel_cache)} semillas)" if n else "📂 0 Excel cargados"
+        if faltantes:
+            texto += f" · {faltantes} ya no se encontró"
+        self._lbl_estado_excel.configure(text=texto)
+
+    def _restaurar_excels(self) -> None:
+        """Al abrir la app, vuelve a cargar los Excel de la sesión anterior (si 'Recordar Excel' está activo)."""
+        cfg = self._leer_config_excel()
+        if not cfg.get("recordar", True) or not cfg.get("archivos"):
+            return
+        rutas = [r for r in cfg["archivos"] if os.path.isfile(r)]
+        faltantes = len(cfg["archivos"]) - len(rutas)
+        if not rutas:
+            self._guardar_config_excel()
+            self._actualizar_estado_excel(faltantes)
+            return
+        self._archivos_excel_cargados = rutas
+        try:
+            self._df_excel_cache, self._advertencias_excel = AN.leer_excels(rutas)
+        except Exception:
+            self._archivos_excel_cargados, self._df_excel_cache = [], pd.DataFrame()
+        self._actualizar_estado_excel(faltantes)
+        if faltantes:
+            self._guardar_config_excel()
+        if not self._df_excel_cache.empty and self._var_fuente_datos.get() == "Solo MySQL":
+            self._var_fuente_datos.set("MySQL + Excel (Combinados)")
+        self._unidad_tocada = False
+        if self._pag_calculos.winfo_ismapped() or self._pag_tablero.winfo_ismapped():
+            self._ejecutar_analisis_ui()
+
+    # --- Importar los Excel cargados a la base de datos ---------------------
+
+    def _importar_excel_desde_historial(self) -> None:
+        """Elige uno o más Excel y guarda sus lotes directo en la base (sin pasar por «Cargar Excel»)."""
+        rutas = filedialog.askopenfilenames(parent=self, title="Importar Excel a la base de datos",
+                                            filetypes=[("Archivos de Excel", "*.xlsx *.xlsm *.xls")])
+        if not rutas:
+            return
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            df, avisos = AN.leer_excels(list(rutas))
+        except Exception as e:
+            messagebox.showerror("Error de lectura", f"No se pudo leer el archivo:\n{e}", parent=self)
+            return
+        finally:
+            self.configure(cursor="")
+        if df.empty:
+            detalle = ("\n\n• " + "\n• ".join(avisos[:6])) if avisos else ""
+            messagebox.showwarning("Sin datos", "No se reconocieron semillas en el archivo. Usa el formato de la "
+                                   "«📋 Plantilla Excel» (pestaña Cálculos y Modelos)." + detalle, parent=self)
+            return
+        self._importar_df_a_bd(df, desde_cargados=False)
+
+    def _importar_excels_a_bd(self) -> None:
+        if self._df_excel_cache is None or self._df_excel_cache.empty:
+            messagebox.showwarning("Sin Excel", "Primero carga uno o más archivos Excel con «➕ Cargar Excel».",
+                                   parent=self)
+            return
+        self._importar_df_a_bd(self._df_excel_cache, desde_cargados=True)
+
+    def _importar_df_a_bd(self, df: pd.DataFrame, desde_cargados: bool) -> None:
+        lotes, r = AN.preparar_importacion(df, self.db.nombres_de_lotes())
+        notas = []
+        if r["repetidos"]:
+            notas.append(f"{len(r['repetidos'])} lote(s) ya estaban en la base y no se repiten.")
+        if r["vacias"]:
+            notas.append(f"{r['vacias']} caja(s) vacía(s) de plantilla no se importan.")
+        if r["sin_pareja"]:
+            notas.append(f"{r['sin_pareja']} columna(s) de archivos con un tratamiento por columna no se importan "
+                         "(raíz y tallo no son de las mismas semillas).")
+        if r["fecha_hoy"]:
+            notas.append(f"{r['fecha_hoy']} lote(s) no traen fecha; se registran con la fecha de hoy.")
+        if not lotes:
+            messagebox.showinfo("Nada que importar", "No hay lotes nuevos para importar.\n\n" + "\n".join(notas),
+                                parent=self)
+            return
+        texto = (f"Se van a agregar a la base de datos {r['lotes']} lote(s) con {r['semillas']} semillas "
+                 f"de {len(r['archivos'])} archivo(s).\n\nAparecerán en el Historial de la primera pestaña y "
+                 "se podrán editar o borrar como cualquier registro.")
+        if notas:
+            texto += "\n\n• " + "\n• ".join(notas)
+        if not messagebox.askyesno("Importar Excel a la base de datos", texto + "\n\n¿Continuar?", parent=self):
+            return
+        ok, msg = self.db.guardar_lotes_importados(lotes)
+        if not ok:
+            messagebox.showerror("Error al importar", msg, parent=self)
+            return
+        if not desde_cargados:
+            self._firma_bd = None
+            self._cargar_historial()
+            if self._pag_calculos.winfo_ismapped() or self._pag_tablero.winfo_ismapped():
+                self._ejecutar_analisis_ui()
+            messagebox.showinfo("✅ Importación terminada", msg, parent=self)
+            return
+        # Lo importado ya está en la base: se quita de los Excel cargados para no contarlo dos veces.
+        importados = {l["archivo"] for l in lotes}
+        self._archivos_excel_cargados = [a for a in self._archivos_excel_cargados
+                                         if os.path.basename(a) not in importados]
+        self._df_excel_cache, self._advertencias_excel = AN.leer_excels(self._archivos_excel_cargados)
+        self._actualizar_estado_excel()
+        self._guardar_config_excel()
+        if self._df_excel_cache.empty:
+            self._var_fuente_datos.set("Solo MySQL")
+        self._firma_bd = None
+        self._cargar_historial()
+        self._ejecutar_analisis_ui()
+        messagebox.showinfo("✅ Importación terminada",
+                            msg + "\n\nLos archivos importados se quitaron de «Excel cargados» para no contarlos "
+                            "dos veces; ahora sus datos se leen desde la base.", parent=self)
 
     def _obtener_dataframe_activo(self) -> pd.DataFrame:
         """Datos según la fuente elegida, leídos con el mismo lector del dashboard (en cm)."""
@@ -2019,12 +2281,78 @@ class BioGrowApp(ctk.CTk):
             firma = (len(registros), max((r.get("medicion_id") or 0 for r in registros), default=0),
                      hash(tuple((r.get("medicion_id"), r.get("longitud_raiz"), r.get("longitud_tallo"),
                                  r.get("germino"), r.get("tiempo_tratamiento"), r.get("temperatura"),
-                                 r.get("nombre_lote"), r.get("tipo_semilla")) for r in registros)))
+                                 r.get("nombre_lote"), r.get("tipo_semilla"), r.get("gas"), r.get("flujo"),
+                                 r.get("orientacion"), r.get("morfologia"), r.get("tipo_tratamiento"))
+                                for r in registros)))
             if getattr(self, "_firma_bd", None) != firma:
                 self._df_bd_cache, _ = AN.leer_base(registros)
                 self._firma_bd = firma
             df_bd = self._df_bd_cache
-        return AN.combinar(df_bd, self._df_excel_cache, modo)
+        return AN.combinar(df_bd, self._df_excel_cache, modo, self._nombres_tecnicos())
+
+    # --- Nombres técnicos de las variedades ---------------------------------
+
+    def _ruta_nombres_tecnicos(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(self.db.db_path)), "biogrow_variedades.json")
+
+    def _nombres_tecnicos(self) -> dict:
+        return AN.leer_nombres_tecnicos(self._ruta_nombres_tecnicos())
+
+    def _editar_nombres_tecnicos(self) -> None:
+        actuales = self._nombres_tecnicos()
+        base = {k for k in actuales if not str(k).startswith("_")}
+        if getattr(self, "_df_activo", None) is not None and not self._df_activo.empty:
+            base |= {re.sub(r"\s*\([^)]*\)$", "", v) for v in AN.variedades(self._df_activo)}
+        base = sorted(b for b in base if b and b not in ("?", "Sin especificar"))
+        top = ctk.CTkToplevel(self)
+        top.title("Nombres técnicos y científicos de las variedades")
+        top.configure(fg_color=UI_COLORS["bg_primary"])
+        centrar_ventana(top, 520, 120 + 46 * len(base))
+        top.transient(self)
+        top.grab_set()
+        card = ctk.CTkFrame(top, fg_color=UI_COLORS["bg_card"], corner_radius=12)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+        card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="Nombre técnico o científico de cada variedad (vacío = solo el nombre común)",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color=UI_COLORS["text_primary"]).grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(10, 8), sticky="w")
+        entradas = {}
+        for i, v in enumerate(base, start=1):
+            ctk.CTkLabel(card, text=v, text_color=UI_COLORS["text_secondary"],
+                         font=ctk.CTkFont(size=11, weight="bold")).grid(row=i, column=0, padx=12, pady=4, sticky="w")
+            e = ctk.CTkEntry(card, fg_color=UI_COLORS["input_bg"], border_color=UI_COLORS["border"],
+                             text_color=UI_COLORS["text_primary"], placeholder_text="Ej: H-392 A o Zea mays var. amylacea")
+            if actuales.get(v):
+                e.insert(0, actuales[v])
+            e.grid(row=i, column=1, padx=12, pady=4, sticky="ew")
+            entradas[v] = e
+
+        def guardar():
+            datos = {v: e.get().strip() for v, e in entradas.items()}
+            try:
+                AN.guardar_nombres_tecnicos(self._ruta_nombres_tecnicos(), datos)
+            except OSError as err:
+                messagebox.showerror("No se pudo guardar", str(err), parent=top)
+                return
+            top.destroy()
+            self._ejecutar_analisis_ui()
+        ctk.CTkButton(card, text="💾 Guardar", fg_color=UI_COLORS["accent_green"], text_color="#ffffff",
+                      command=guardar).grid(row=len(base) + 1, column=0, columnspan=2, padx=12, pady=(10, 12), sticky="ew")
+
+    def _descargar_plantilla(self) -> None:
+        ruta = filedialog.asksaveasfilename(parent=self, title="Guardar plantilla de Excel", defaultextension=".xlsx",
+                                            initialfile="Plantilla_BioGrow.xlsx", filetypes=[("Archivos de Excel", "*.xlsx")])
+        if not ruta:
+            return
+        try:
+            with open(ruta, "wb") as f:
+                f.write(AN.excel_machote())
+            messagebox.showinfo("✅ Plantilla guardada",
+                                f"Plantilla guardada en:\n{ruta}\n\nLlena la hoja 'Datos' (una semilla por fila) y "
+                                "cárgala con «➕ Cargar Excel». En la hoja 'Léeme' están los valores permitidos.",
+                                parent=self)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar la plantilla:\n{e}", parent=self)
 
     # -----------------------------------------------------------------------
     # Página 2: Cálculos y Modelos (lo mismo que muestra el dashboard)
@@ -2036,7 +2364,7 @@ class BioGrowApp(ctk.CTk):
 
     def _construir_seccion_calculos(self, padre: ctk.CTkFrame) -> None:
         padre.grid_columnconfigure(0, weight=1)
-        padre.grid_rowconfigure(2, weight=1)
+        padre.grid_rowconfigure(3, weight=1)
         self._unidad_tocada = False
         self._df_bd_cache = pd.DataFrame()
         recalcular = lambda *_: self._ejecutar_analisis_ui()
@@ -2056,20 +2384,28 @@ class BioGrowApp(ctk.CTk):
             variable=self._var_fuente_datos, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             selected_color=UI_COLORS["accent_indigo"], command=recalcular,
         ).pack(side="left", padx=(0, 12))
-        ctk.CTkButton(top_bar, text="➕ Cargar / Combinar Excel (.xlsx)", height=30,
+        ctk.CTkButton(top_bar, text="➕ Cargar Excel", height=30, width=115,
                       fg_color=UI_COLORS["accent_green"], hover_color=UI_COLORS["accent_hover"],
                       text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
                       command=self._cargar_excels_externos).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(top_bar, text="🧹 Quitar Excel", width=95, height=30, fg_color=UI_COLORS["bg_secondary"],
+        ctk.CTkButton(top_bar, text="🧹 Quitar", width=75, height=30, fg_color=UI_COLORS["bg_secondary"],
                       text_color=UI_COLORS["text_primary"], hover_color=UI_COLORS["border"],
-                      font=ctk.CTkFont(size=11), command=self._limpiar_excels_externos).pack(side="left", padx=(0, 10))
+                      font=ctk.CTkFont(size=11), command=self._limpiar_excels_externos).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(top_bar, text="📥 Importar a la base", width=150, height=30,
+                      fg_color=UI_COLORS["accent_amber"], hover_color="#b45309", text_color="#ffffff",
+                      font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._importar_excels_a_bd).pack(side="left", padx=(0, 8))
+        self._var_recordar_excel = tk.BooleanVar(value=self._leer_config_excel().get("recordar", True))
+        ctk.CTkCheckBox(top_bar, text="Recordar Excel", variable=self._var_recordar_excel,
+                        font=ctk.CTkFont(size=11), checkbox_width=18, checkbox_height=18,
+                        command=self._guardar_config_excel).pack(side="left", padx=(0, 8))
         self._lbl_estado_excel = ctk.CTkLabel(top_bar, text="📂 0 Excel cargados", font=ctk.CTkFont(size=11),
                                               text_color=UI_COLORS["text_secondary"])
         self._lbl_estado_excel.pack(side="left", padx=(4, 0))
         ctk.CTkButton(top_bar, text="🔄 Recalcular", width=100, height=30, fg_color=UI_COLORS["accent_indigo"],
                       text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
                       command=self._ejecutar_analisis_ui).pack(side="right")
-        ctk.CTkButton(top_bar, text="📄 Reporte PDF de los cálculos", width=190, height=30,
+        ctk.CTkButton(top_bar, text="📄 Reporte PDF", width=120, height=30,
                       fg_color=UI_COLORS["accent_red"], hover_color="#b91c1c", text_color="#ffffff",
                       font=ctk.CTkFont(size=11, weight="bold"),
                       command=self._exportar_reporte_calculos).pack(side="right", padx=(0, 8))
@@ -2126,6 +2462,12 @@ class BioGrowApp(ctk.CTk):
                            ("Excluir cajas vacías", self._var_cajas_vacias)]:
             ctk.CTkCheckBox(desc_bar, text=texto, variable=var, font=ctk.CTkFont(size=11),
                             checkbox_width=18, checkbox_height=18, command=recalcular).pack(side="left", padx=(0, 14))
+        ctk.CTkButton(desc_bar, text="🏷️ Nombres técnicos", width=140, height=28, fg_color=UI_COLORS["bg_secondary"],
+                      text_color=UI_COLORS["text_primary"], hover_color=UI_COLORS["border"], font=ctk.CTkFont(size=11),
+                      command=self._editar_nombres_tecnicos).pack(side="right")
+        ctk.CTkButton(desc_bar, text="📋 Plantilla Excel", width=130, height=28, fg_color=UI_COLORS["bg_secondary"],
+                      text_color=UI_COLORS["text_primary"], hover_color=UI_COLORS["border"], font=ctk.CTkFont(size=11),
+                      command=self._descargar_plantilla).pack(side="right", padx=(0, 8))
 
         # Dictamen y conclusión
         self._txt_conclusion_anova = ctk.CTkTextbox(
@@ -2134,13 +2476,38 @@ class BioGrowApp(ctk.CTk):
             corner_radius=10, wrap="word")
         self._txt_conclusion_anova.grid(row=1, column=0, pady=(0, 8), sticky="ew")
 
+        # Tarjetas con los estadísticos principales
+        tarjetas = ctk.CTkFrame(padre, fg_color="transparent")
+        tarjetas.grid(row=2, column=0, pady=(0, 8), sticky="ew")
+        tarjetas.grid_columnconfigure(tuple(range(6)), weight=1, uniform="tarj")
+        self._tarjetas_calc = {}
+        for i, (clave, titulo, color) in enumerate([
+                ("anova", "🧮 ANOVA · F calculada vs F crítica", "accent_red"),
+                ("p", "📉 p-valor", "accent_indigo"),
+                ("gl", "🔢 Grados de libertad", "accent_amber"),
+                ("cme", "📐 CM del error", "accent_indigo"),
+                ("tukey", "🔠 Tukey", "accent_green"),
+                ("lsd", "🔡 LSD de Fisher", "accent_green")]):
+            card = ctk.CTkFrame(tarjetas, fg_color=UI_COLORS["bg_card"], corner_radius=10, border_width=2,
+                                border_color=UI_COLORS[color])
+            card.grid(row=0, column=i, padx=(0 if i == 0 else 4, 0 if i == 5 else 4), sticky="nsew")
+            ctk.CTkLabel(card, text=titulo, font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                         text_color=UI_COLORS["text_secondary"], anchor="w").pack(anchor="w", padx=12, pady=(8, 0))
+            valor = ctk.CTkLabel(card, text="—", font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                 text_color=UI_COLORS["text_primary"], anchor="w")
+            valor.pack(anchor="w", padx=12)
+            sub = ctk.CTkLabel(card, text="", font=ctk.CTkFont(family="Segoe UI", size=10),
+                               text_color=UI_COLORS["text_secondary"], anchor="w", justify="left", wraplength=210)
+            sub.pack(anchor="w", padx=12, pady=(0, 8))
+            self._tarjetas_calc[clave] = (card, valor, sub)
+
         # Sub-pestañas con las mismas secciones del dashboard
         self._tabs_estadistica = ctk.CTkTabview(
             padre, fg_color=UI_COLORS["bg_card"], segmented_button_fg_color=UI_COLORS["bg_secondary"],
             segmented_button_selected_color=UI_COLORS["accent_green"],
             segmented_button_unselected_color=UI_COLORS["bg_secondary"], text_color=UI_COLORS["text_primary"],
             corner_radius=12, border_width=1, border_color=UI_COLORS["border"])
-        self._tabs_estadistica.grid(row=2, column=0, sticky="nsew")
+        self._tabs_estadistica.grid(row=3, column=0, sticky="nsew")
         t_res = self._tabs_estadistica.add("📌 Resumen")
         t_desc = self._tabs_estadistica.add("📊 Promedio, DE y varianza")
         t_anov = self._tabs_estadistica.add("🧮 ANOVA")
@@ -2161,6 +2528,7 @@ class BioGrowApp(ctk.CTk):
         self._nota_resumen = _nota(t_res, 0, "Grupos que comparten una letra no difieren entre sí. Tukey es la "
                                    "prueba más estricta; LSD separa más grupos.")
         self._tree_ranking = self._crear_tabla_estadistica(t_res, 1)
+        self.after(400, self._restaurar_excels)
         ctk.CTkLabel(t_res, text="¿Qué grupos difieren? (Tukey)", anchor="w",
                      font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                      text_color=UI_COLORS["text_primary"]).grid(row=2, column=0, sticky="ew", padx=6, pady=(6, 0))
@@ -2188,6 +2556,8 @@ class BioGrowApp(ctk.CTk):
         t_lsd.grid_rowconfigure(3, weight=2)
         self._nota_lsd = _nota(t_lsd)
         self._tree_lsd = self._crear_tabla_estadistica(t_lsd, 1)
+        for t in (self._tree_ranking, self._tree_desc, self._tree_anova, self._tree_tukey, self._tree_lsd):
+            self._activar_fondo_tabla(t, "calculos", "BioGrow.Treeview")
         _nota(t_lsd, 2, "Letras de LSD (misma letra = no difieren):")
         self._tree_letras_lsd = self._crear_tabla_estadistica(t_lsd, 3)
 
@@ -2230,10 +2600,10 @@ class BioGrowApp(ctk.CTk):
     def _estilizar_tablas_estadisticas(self) -> None:
         p = TTK_PALETTES[self._modo_actual]
         for tree in getattr(self, "_tablas_estadisticas", []):
-            tree.tag_configure("si", foreground=p["accent_green"], background=p["bg_card"])
-            tree.tag_configure("no", foreground=p["accent_red"], background=p["bg_card"])
-            tree.tag_configure("alt", background=p["row_alt"], foreground=p["text_primary"])
-            tree.tag_configure("norm", background=p["bg_card"], foreground=p["text_primary"])
+            tree.tag_configure("si", foreground=p["accent_green"], background=self._bg_fila(tree, p["bg_card"]))
+            tree.tag_configure("no", foreground=p["accent_red"], background=self._bg_fila(tree, p["bg_card"]))
+            tree.tag_configure("alt", background=self._bg_fila(tree, p["row_alt"]), foreground=p["text_primary"])
+            tree.tag_configure("norm", background=self._bg_fila(tree, p["bg_card"]), foreground=p["text_primary"])
 
     def _opciones_descartes(self) -> dict:
         return {
@@ -2298,6 +2668,7 @@ class BioGrowApp(ctk.CTk):
             if res.get("variable") == "Germinó":
                 self._var_unidad_calc.set("Por caja (promedio de sus semillas)")
 
+        self._actualizar_tarjetas_calc(res)
         if not res.get("ok"):
             for t in tablas:
                 self._llenar_tabla(t, None)
@@ -2354,6 +2725,37 @@ class BioGrowApp(ctk.CTk):
         self._llenar_tabla(self._tree_letras_lsd,
                            res["letras_lsd"].rename(columns={"Media": f"Promedio ({u})"}) if an else None)
 
+    def _actualizar_tarjetas_calc(self, res: dict) -> None:
+        if not hasattr(self, "_tarjetas_calc"):
+            return
+        an = res.get("anova") if res.get("ok") else None
+        def poner(clave, valor, sub="", color=None):
+            card, lv, ls = self._tarjetas_calc[clave]
+            lv.configure(text=valor, text_color=color or UI_COLORS["text_primary"])
+            ls.configure(text=sub)
+        if not an:
+            for k in self._tarjetas_calc:
+                poner(k, "—", "Se necesitan 2 grupos con 2 o más datos" if k == "anova" else "")
+            return
+        u, u2, alfa = res["u"], res["u2"], res["alfa"]
+        sig = an["significativo"]
+        color = UI_COLORS["accent_green"] if sig else UI_COLORS["accent_red"]
+        poner("anova", f"{an['F calculada']:.2f} {'>' if sig else '≤'} {an['F crítica']:.2f}",
+              ("✔ Sí hay diferencias" if sig else "✘ No hay diferencias") + f" (α = {alfa})", color)
+        poner("p", f"{an['p-valor']:.4f}", f"{'menor' if an['p-valor'] < alfa else 'mayor o igual'} que α = {alfa}", color)
+        poner("gl", f"{an['GL entre']} y {an['GL error']}", f"entre grupos (k − 1) y error (n − k) · n = {an['n total']}")
+        poner("cme", f"{an['CM error']:.3f}", f"{u2} · varianza dentro de los grupos")
+        for clave, tabla, crit, margen in [("tukey", res["tukey"], "q crítica", "DHS"),
+                                           ("lsd", res["lsd"], "t crítica", "LSD")]:
+            if tabla is None or tabla.empty:
+                poner(clave, "—")
+                continue
+            n_sig = int((tabla["Resultado"] == AN.M.SIG).sum())
+            mn, mx = tabla[margen].min(), tabla[margen].max()
+            rango = f"{mn:.2f}" if abs(mx - mn) < 0.005 else f"{mn:.2f}–{mx:.2f}"
+            poner(clave, f"{crit.split()[0]} crít = {tabla[crit].iloc[0]:.3f}",
+                  f"{margen} = {rango} {u} · {n_sig} de {len(tabla)} pares difieren")
+
     def _exportar_reporte_calculos(self) -> None:
         res = self._ultimo_resultado_stats
         if not res or not res.get("ok"):
@@ -2385,6 +2787,7 @@ class BioGrowApp(ctk.CTk):
             if not self._var_fuente_datos.get().startswith("Solo MySQL") else "",
             "variedad": self._var_filtro_var_calc.get(),
             "descartes": "; ".join(descartes),
+            "proyecto": AN.resumen_proyecto(res.get("df_filtrado"), self._var_fuente_datos.get().replace("MySQL", "Base de datos")),
         }
         self.configure(cursor="watch")
         self.update_idletasks()
@@ -2417,7 +2820,7 @@ class BioGrowApp(ctk.CTk):
         ctk.CTkLabel(fila1, text="📊 Tipo de Gráfica:", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                      text_color=UI_COLORS["text_primary"]).pack(side="left", padx=(6, 6))
         self._var_tipo_grafica = tk.StringVar(value=GR.TIPOS[0])
-        ctk.CTkComboBox(fila1, variable=self._var_tipo_grafica, values=GR.TIPOS, width=330, state="readonly",
+        ctk.CTkComboBox(fila1, variable=self._var_tipo_grafica, values=GR.TIPOS, width=390, state="readonly",
                         command=redibujar).pack(side="left", padx=6)
         self._etiqueta_control(fila1, "  Letras:")
         self._var_letras_graf = tk.StringVar(value="Tukey")
@@ -2428,10 +2831,37 @@ class BioGrowApp(ctk.CTk):
         ctk.CTkComboBox(fila1, variable=self._var_error_graf,
                         values=["Desviación estándar", "Error estándar (SEM)", "IC 95%"], width=170,
                         state="readonly", command=redibujar).pack(side="left", padx=4)
-        ctk.CTkButton(fila1, text="💾 Guardar Gráfica (PNG/PDF)", width=170, fg_color=UI_COLORS["accent_green"],
+        ctk.CTkButton(fila1, text="🗂️ Varias gráficas → PDF / Excel", width=200, fg_color=UI_COLORS["accent_indigo"],
+                      text_color="#ffffff", font=ctk.CTkFont(size=11, weight="bold"),
+                      command=self._exportar_varias_graficas).pack(side="right", padx=6)
+        ctk.CTkButton(fila1, text="💾 Guardar gráfica (PNG/PDF/Excel)", width=210, fg_color=UI_COLORS["accent_green"],
                       hover_color=UI_COLORS["accent_hover"], text_color="#ffffff",
                       font=ctk.CTkFont(size=11, weight="bold"),
                       command=self._guardar_grafica_archivo).pack(side="right", padx=6)
+
+        # Opciones de la gráfica de tendencia
+        fila_t = ctk.CTkFrame(ctrl_graf, fg_color="transparent")
+        fila_t.pack(fill="x", padx=10, pady=(2, 2))
+        self._etiqueta_control(fila_t, "📈 Tendencia (gráfica 11) — Eje X:")
+        self._var_eje_tend = tk.StringVar(value=GR.EJES_TENDENCIA[0])
+        ctk.CTkComboBox(fila_t, variable=self._var_eje_tend, values=GR.EJES_TENDENCIA, width=200, state="readonly",
+                        command=redibujar).pack(side="left", padx=(0, 10))
+        self._etiqueta_control(fila_t, "Series:")
+        self._var_series_tend = tk.StringVar(value="Variedad")
+        self._series_elegidas: Optional[set] = None
+
+        def _series_cambiadas(_=None):
+            self._series_elegidas = None
+            self._lbl_series_tend.configure(text="todas")
+            self._dibujar_grafica_tablero()
+        ctk.CTkComboBox(fila_t, variable=self._var_series_tend, values=list(GR.SERIES_TENDENCIA), width=170,
+                        state="readonly", command=_series_cambiadas).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(fila_t, text="Elegir series…", width=110, height=26, fg_color=UI_COLORS["bg_secondary"],
+                      text_color=UI_COLORS["text_primary"], hover_color=UI_COLORS["border"],
+                      font=ctk.CTkFont(size=11), command=self._elegir_series_tendencia).pack(side="left", padx=(0, 6))
+        self._lbl_series_tend = ctk.CTkLabel(fila_t, text="todas", font=ctk.CTkFont(size=11),
+                                             text_color=UI_COLORS["text_secondary"])
+        self._lbl_series_tend.pack(side="left")
 
         # Filtros rápidos: se suman a los de 'Cálculos y Modelos' (variable, comparación y descartes)
         fila2 = ctk.CTkFrame(ctrl_graf, fg_color="transparent")
@@ -2458,6 +2888,12 @@ class BioGrowApp(ctk.CTk):
         self._cmb_hasta = ctk.CTkComboBox(fila2, variable=self._var_fecha_hasta, values=["Todas"], width=115,
                                           state="readonly", command=redibujar)
         self._cmb_hasta.pack(side="left", padx=(0, 10))
+        self._etiqueta_control(fila2, "💨 Gas:")
+        self._var_filtro_gas_tablero = tk.StringVar(value="Todos los gases")
+        self._cmb_gas_tablero = ctk.CTkComboBox(fila2, variable=self._var_filtro_gas_tablero,
+                                                values=["Todos los gases"], width=140, state="readonly",
+                                                command=redibujar)
+        self._cmb_gas_tablero.pack(side="left", padx=(0, 10))
         self._lbl_info_tablero = ctk.CTkLabel(fila2, text="", font=ctk.CTkFont(size=11),
                                               text_color=UI_COLORS["text_secondary"])
         self._lbl_info_tablero.pack(side="left", padx=(6, 0))
@@ -2494,6 +2930,8 @@ class BioGrowApp(ctk.CTk):
             (self._cmb_trat_tablero, self._var_filtro_trat_tablero, "Todos los tratamientos", AN.tratamientos(df)),
             (self._cmb_desde, self._var_fecha_desde, "Todas", AN.fechas(df)),
             (self._cmb_hasta, self._var_fecha_hasta, "Todas", AN.fechas(df)),
+            (self._cmb_gas_tablero, self._var_filtro_gas_tablero, "Todos los gases",
+             sorted(g for g in df["Gas"].dropna().astype(str).unique() if g != "Sin dato") if "Gas" in df else []),
         ]:
             opciones = [todos] + valores
             cmb.configure(values=opciones)
@@ -2512,7 +2950,47 @@ class BioGrowApp(ctk.CTk):
             f["desde"] = self._var_fecha_desde.get()
         if self._var_fecha_hasta.get() not in ("", "Todas"):
             f["hasta"] = self._var_fecha_hasta.get()
+        g = self._var_filtro_gas_tablero.get()
+        if g and g != "Todos los gases":
+            f["gas"] = g
         return f
+
+    def _opciones_tendencia(self) -> dict:
+        return {"eje": self._var_eje_tend.get(), "series": self._var_series_tend.get(),
+                "seleccion": sorted(self._series_elegidas) if self._series_elegidas else None}
+
+    def _elegir_series_tendencia(self) -> None:
+        col = GR.SERIES_TENDENCIA.get(self._var_series_tend.get())
+        df = getattr(self, "_df_activo", pd.DataFrame())
+        if not col or df.empty or col not in df:
+            messagebox.showinfo("Series", "Elige primero qué serie usar (Variedad, Tipo de gas…).", parent=self)
+            return
+        valores = sorted(v for v in df[col].dropna().astype(str).unique() if v not in ("Sin dato", "nan"))
+        top = ctk.CTkToplevel(self)
+        top.title("Series de la tendencia")
+        top.configure(fg_color=UI_COLORS["bg_primary"])
+        centrar_ventana(top, 380, min(640, 150 + 34 * len(valores)))
+        top.transient(self)
+        top.grab_set()
+        marco = ctk.CTkScrollableFrame(top, fg_color=UI_COLORS["bg_card"])
+        marco.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        variables = {}
+        for v in valores:
+            var = tk.BooleanVar(value=self._series_elegidas is None or v in self._series_elegidas)
+            ctk.CTkCheckBox(marco, text=v, variable=var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=3, padx=6)
+            variables[v] = var
+
+        def aplicar():
+            elegidas = {v for v, var in variables.items() if var.get()}
+            self._series_elegidas = None if len(elegidas) in (0, len(valores)) else elegidas
+            self._lbl_series_tend.configure(text="todas" if self._series_elegidas is None
+                                            else f"{len(elegidas)} de {len(valores)}")
+            top.destroy()
+            if not self._var_tipo_grafica.get().startswith("11"):
+                self._var_tipo_grafica.set(GR.TIPOS[10])
+            self._dibujar_grafica_tablero()
+        ctk.CTkButton(top, text="Aplicar", fg_color=UI_COLORS["accent_green"], text_color="#ffffff",
+                      command=aplicar).pack(fill="x", padx=12, pady=(0, 12))
 
     def _actualizar_kpis_tablero(self, res: Optional[dict] = None) -> None:
         res = res if res is not None else self._ultimo_resultado_stats
@@ -2545,20 +3023,23 @@ class BioGrowApp(ctk.CTk):
                 res = self._analizar(self._df_activo, filtros)
             except Exception as e:
                 res = {"ok": False, "mensaje": f"No se pudo hacer el análisis: {e}"}
-            self._lbl_info_tablero.configure(text="Filtros del tablero activos (se suman a los de Cálculos y Modelos).")
+            self._lbl_info_tablero.configure(text="Filtros activos (se suman a Cálculos y Modelos).")
         else:
             res = self._ultimo_resultado_stats or {"ok": False, "mensaje": "Sin datos."}
-            self._lbl_info_tablero.configure(text="Misma variable, comparación y descartes de 'Cálculos y Modelos'.")
+            self._lbl_info_tablero.configure(text="Misma configuración que Cálculos y Modelos.")
         self._actualizar_kpis_tablero(res)
+        self._res_tablero = res
 
         for child in self._chart_container.winfo_children():
             child.destroy()
         p = TTK_PALETTES[self._modo_actual]
         try:
             fig = GR.dibujar(self._var_tipo_grafica.get(), res, p, self._var_letras_graf.get(),
-                             self._var_error_graf.get())
+                             self._var_error_graf.get(), self._opciones_tendencia())
         except Exception as e:
             fig = GR._mensaje(p, f"No se pudo dibujar esta gráfica: {e}")
+        if res.get("ok"):
+            FD.fondo_en_figura(fig, "tablero", self._modo_actual)  # solo en pantalla, no en lo exportado
         self._fig_actual = fig
 
         alto_px = int(fig.get_figheight() * fig.dpi)
@@ -2589,6 +3070,15 @@ class BioGrowApp(ctk.CTk):
         toolbar.pack(side="left")
         self._canvas_widget = canvas
 
+    def _figura_para_exportar(self, tipo: str, res: dict):
+        """La misma gráfica, en colores claros (fondo blanco) para documentos."""
+        return GR.dibujar(tipo, res, TTK_PALETTES["light"], self._var_letras_graf.get(),
+                          self._var_error_graf.get(), self._opciones_tendencia())
+
+    def _proyecto_actual(self, res: dict) -> pd.DataFrame:
+        fuente = self._var_fuente_datos.get().replace("MySQL", "Base de datos")
+        return AN.resumen_proyecto(res.get("df_filtrado") if res else None, fuente)
+
     def _guardar_grafica_archivo(self) -> None:
         if self._fig_actual is None:
             messagebox.showwarning("Sin gráfica", "Primero genera una gráfica en el tablero.", parent=self)
@@ -2598,8 +3088,92 @@ class BioGrowApp(ctk.CTk):
             title="Guardar gráfica actual",
             defaultextension=".png",
             initialfile=f"Grafica_BioGrow_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
-            filetypes=[("Imagen PNG (Alta resolución)", "*.png"), ("Documento PDF", "*.pdf"), ("Imagen JPG", "*.jpg")],
+            filetypes=[("Imagen PNG (Alta resolución)", "*.png"), ("Documento PDF", "*.pdf"), ("Imagen JPG", "*.jpg"),
+                       ("Excel (gráfica + datos)", "*.xlsx")],
         )
-        if ruta:
-            self._fig_actual.savefig(ruta, dpi=300, bbox_inches="tight", facecolor=self._fig_actual.get_facecolor())
-            messagebox.showinfo("✅ Gráfica Guardada", f"Gráfica exportada en alta resolución (300 DPI):\n{ruta}", parent=self)
+        if not ruta:
+            return
+        try:
+            if ruta.lower().endswith(".xlsx"):
+                res = getattr(self, "_res_tablero", None) or {}
+                tipo = self._var_tipo_grafica.get()
+                EX.exportar_excel(ruta, [(tipo, self._figura_para_exportar(tipo, res))], res,
+                                  self._proyecto_actual(res), incluir_tablas=True)
+                messagebox.showinfo("✅ Gráfica Guardada", f"Excel con la gráfica, sus datos y los cálculos:\n{ruta}",
+                                    parent=self)
+            else:
+                self._fig_actual.savefig(ruta, dpi=300, bbox_inches="tight", facecolor=self._fig_actual.get_facecolor())
+                messagebox.showinfo("✅ Gráfica Guardada", f"Gráfica exportada en alta resolución (300 DPI):\n{ruta}",
+                                    parent=self)
+        except Exception as e:
+            messagebox.showerror("Error al guardar", f"No se pudo guardar la gráfica:\n{e}", parent=self)
+
+    def _exportar_varias_graficas(self) -> None:
+        res = getattr(self, "_res_tablero", None)
+        if not res or not res.get("ok"):
+            messagebox.showwarning("Sin datos", "No hay un análisis para graficar con la selección actual.", parent=self)
+            return
+        top = ctk.CTkToplevel(self)
+        top.title("Exportar varias gráficas")
+        top.configure(fg_color=UI_COLORS["bg_primary"])
+        centrar_ventana(top, 520, 640)
+        top.transient(self)
+        top.grab_set()
+        ctk.CTkLabel(top, text="Elige las gráficas que irán en un solo archivo",
+                     font=ctk.CTkFont(size=13, weight="bold"), text_color=UI_COLORS["text_primary"]).pack(
+            anchor="w", padx=16, pady=(14, 4))
+        ctk.CTkLabel(top, text="Usan la configuración actual (variable, comparación, filtros, letras y tendencia).",
+                     font=ctk.CTkFont(size=11), text_color=UI_COLORS["text_secondary"]).pack(anchor="w", padx=16)
+        marco = ctk.CTkScrollableFrame(top, fg_color=UI_COLORS["bg_card"], height=330)
+        marco.pack(fill="both", expand=True, padx=16, pady=8)
+        por_defecto = {"1", "2", "9", "10", "12"}
+        elegidas = {}
+        for t in GR.TIPOS:
+            var = tk.BooleanVar(value=t.split(".")[0] in por_defecto)
+            ctk.CTkCheckBox(marco, text=t, variable=var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=3, padx=6)
+            elegidas[t] = var
+        opciones = ctk.CTkFrame(top, fg_color="transparent")
+        opciones.pack(fill="x", padx=16)
+        self._etiqueta_control(opciones, "Formato:")
+        var_formato = tk.StringVar(value="PDF")
+        ctk.CTkSegmentedButton(opciones, values=["PDF", "Excel", "PDF y Excel"], variable=var_formato).pack(side="left")
+        var_tablas = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(top, text="Incluir en el Excel las tablas de cálculos y los datos de cada grupo",
+                        variable=var_tablas, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16, pady=(8, 0))
+
+        def exportar():
+            tipos = [t for t, v in elegidas.items() if v.get()]
+            if not tipos:
+                messagebox.showwarning("Sin gráficas", "Marca al menos una gráfica.", parent=top)
+                return
+            formato = var_formato.get()
+            ext = ".xlsx" if formato == "Excel" else ".pdf"
+            ruta = filedialog.asksaveasfilename(
+                parent=top, title="Guardar gráficas", defaultextension=ext,
+                initialfile=f"Graficas_BioGrow_{datetime.now().strftime('%Y%m%d_%H%M')}{ext}",
+                filetypes=[("Excel", "*.xlsx")] if ext == ".xlsx" else [("PDF", "*.pdf")])
+            if not ruta:
+                return
+            top.configure(cursor="watch")
+            top.update_idletasks()
+            try:
+                figuras = [(t, self._figura_para_exportar(t, res)) for t in tipos]
+                proyecto = self._proyecto_actual(res)
+                hechos = []
+                if formato in ("PDF", "PDF y Excel"):
+                    ruta_pdf = os.path.splitext(ruta)[0] + ".pdf"
+                    EX.exportar_pdf(ruta_pdf, figuras, res, proyecto)
+                    hechos.append(ruta_pdf)
+                if formato in ("Excel", "PDF y Excel"):
+                    ruta_xl = os.path.splitext(ruta)[0] + ".xlsx"
+                    EX.exportar_excel(ruta_xl, figuras, res, proyecto, var_tablas.get())
+                    hechos.append(ruta_xl)
+            except Exception as e:
+                top.configure(cursor="")
+                messagebox.showerror("Error al exportar", f"No se pudieron exportar las gráficas:\n{e}", parent=top)
+                return
+            top.destroy()
+            messagebox.showinfo("✅ Gráficas exportadas", f"{len(tipos)} gráfica(s) guardadas en:\n" + "\n".join(hechos),
+                                parent=self)
+        ctk.CTkButton(top, text="💾 Exportar", fg_color=UI_COLORS["accent_green"], text_color="#ffffff",
+                      font=ctk.CTkFont(size=12, weight="bold"), command=exportar).pack(fill="x", padx=16, pady=12)

@@ -10,6 +10,7 @@ analisis_biogrow.py — Une la app de escritorio con el motor del dashboard (mot
 from __future__ import annotations
 
 import io
+import os
 import re
 from typing import Iterable, List, Optional, Tuple
 
@@ -19,9 +20,29 @@ import pandas as pd
 import motor_biogrow as M
 
 NOMBRE_BD = "Base de datos BioGrow.xlsx"
-ENCABEZADOS_BD = ["Lote Origen", "Variedad de Semilla", "No. Muestra", "Tratamiento",
-                  "Temperatura (°C)", "Cant. Hojas", "Raíz (mm)", "Tallo (mm)", "Estado",
-                  "Fecha de Registro"]
+# Columnas del machote (plantilla para subir Excel). Es también el formato del Excel exportado.
+ENCABEZADOS_BD = ["Lote Origen", "Variedad de Semilla", "No. Muestra", "Tipo de tratamiento", "Tratamiento",
+                  "Temperatura (°C)", "Tipo de gas", "Flujo (L/min)", "Orientación", "Morfología",
+                  "Cant. Hojas", "Raíz (mm)", "Tallo (mm)", "Estado", "Fecha de Registro"]
+DESCRIPCION_COLUMNAS = [
+    ("Lote Origen", "Nombre de la caja / lote. Todas las semillas de un lote llevan el mismo nombre.",
+     "Lote 16-Mayo Blanco 45s"),
+    ("Variedad de Semilla", "Maíz blanco, rosa, cacahuazintle, criollo o lenteja (el nombre técnico o científico "
+     "entre paréntesis es opcional).", "Semilla de maíz blanco (PBB-DH-183)"),
+    ("No. Muestra", "Número de la semilla dentro del lote (1, 2, 3…).", "1"),
+    ("Tipo de tratamiento", "Plasma, Salino, Térmico o Solución (vacío = Plasma).", "Plasma"),
+    ("Tratamiento", "Tiempo de tratamiento: Control, 30s, 45s, 60s, 2min…", "45s"),
+    ("Temperatura (°C)", "Campo libre: un número en °C, un rango (35-40 °C), Ambiente u otro texto.", "35"),
+    ("Tipo de gas", "Sin gas, Aire, Oxígeno, Helio, Argón o Nitrógeno.", "Argón"),
+    ("Flujo (L/min)", "Litros por minuto (número). Vacío si no hubo flujo.", "2"),
+    ("Orientación", "Aleatorio, Embrión o Endospermo.", "Embrión"),
+    ("Morfología", "Plana o Bola.", "Plana"),
+    ("Cant. Hojas", "Número entero (0 si no germinó).", "2"),
+    ("Raíz (mm)", "Longitud de raíz en milímetros (0 si no germinó).", "84.5"),
+    ("Tallo (mm)", "Longitud de tallo en milímetros (0 si no germinó).", "52.1"),
+    ("Estado", "Germinó o No germinó.", "Germinó"),
+    ("Fecha de Registro", "AAAA-MM-DD HH:MM:SS", "2026-10-28 09:00:00"),
+]
 
 # "Comparar por": etiqueta visible -> columnas del motor (None = automático según el experimento)
 OPCIONES_COMPARAR = {
@@ -31,6 +52,18 @@ OPCIONES_COMPARAR = {
     "Variedad": ["Variedad"],
     "Temperatura": ["Temperatura"],
     "Variedad + Temperatura": ["Variedad", "Temperatura"],
+    "Variedad + Combinación de tratamiento": ["Variedad", "Combinación"],
+    "Combinación de tratamiento": ["Combinación"],
+    "Tipo de tratamiento (plasma, salino…)": ["Tipo de tratamiento"],
+    "Variedad + Tipo de tratamiento": ["Variedad", "Tipo de tratamiento"],
+    "Tipo de gas": ["Gas"],
+    "Variedad + Tipo de gas": ["Variedad", "Gas"],
+    "Flujo (L/min)": ["Flujo"],
+    "Variedad + Flujo": ["Variedad", "Flujo"],
+    "Orientación de la semilla": ["Orientación"],
+    "Variedad + Orientación": ["Variedad", "Orientación"],
+    "Morfología de la semilla": ["Morfología"],
+    "Variedad + Morfología": ["Variedad", "Morfología"],
     "Parte expuesta (Embrión / Endospermo / Patrón)": ["Clase nombre"],
     "Fecha / hoja": ["Hoja"],
     "Archivo / origen": ["Archivo"],
@@ -39,6 +72,8 @@ ETIQUETAS_DIM = {
     "Temperatura": "Temperatura", "Tratamiento": "Tratamiento", "Clase nombre": "Parte expuesta",
     "Variedad": "Variedad", "Condición": "Condición", "Tirada": "Tirada", "Bloque": "Bloque",
     "Hoja": "Fecha / hoja", "Archivo": "Archivo", "Fecha etiqueta": "Fecha", "Corrida": "Caja",
+    "Combinación": "Combinación de tratamiento", "Gas": "Tipo de gas", "Flujo": "Flujo",
+    "Orientación": "Orientación", "Morfología": "Morfología", "Tipo de tratamiento": "Tipo de tratamiento",
 }
 
 
@@ -63,18 +98,95 @@ def excel_desde_registros(registros: Iterable[dict]) -> bytes:
             germino = 1 if ((raiz or 0) > 0 or (tallo or 0) > 0) else 0
         fecha = r.get("fecha_registro")
         fecha = fecha.strftime("%Y-%m-%d %H:%M:%S") if hasattr(fecha, "strftime") else str(fecha or "")
-        hojas = r.get("cantidad_hojas")
-        ws.append([
-            str(r.get("nombre_lote") or "").strip(),
-            str(r.get("tipo_semilla") or "").strip(),
-            int(r.get("num_muestra") or 0),
-            str(r.get("tiempo_tratamiento") or "").strip(),
-            str(r.get("temperatura") or "Ambiente").strip(),
-            int(hojas) if hojas not in (None, "") else None,
-            raiz, tallo,
-            "Germinó" if int(germino) == 1 else "No germinó",
-            fecha,
-        ])
+        ws.append(_fila_machote(r, raiz, tallo, germino, fecha))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _fila_machote(r, raiz, tallo, germino, fecha) -> list:
+    hojas = r.get("cantidad_hojas")
+    flujo = r.get("flujo")
+    return [
+        str(r.get("nombre_lote") or "").strip(),
+        str(r.get("tipo_semilla") or "").strip(),
+        int(r.get("num_muestra") or 0),
+        str(r.get("tipo_tratamiento") or "Plasma").strip(),
+        str(r.get("tiempo_tratamiento") or "").strip(),
+        str(r.get("temperatura") or "Ambiente").strip(),
+        r.get("gas") or None,
+        float(flujo) if flujo not in (None, "") else None,
+        r.get("orientacion") or None,
+        r.get("morfologia") or None,
+        int(hojas) if hojas not in (None, "") else None,
+        raiz, tallo,
+        "Germinó" if int(germino) == 1 else "No germinó",
+        fecha,
+    ]
+
+
+def excel_machote(registros: Iterable[dict] = (), titulo: Optional[str] = None) -> bytes:
+    """Excel con el formato del machote: hoja 'Datos' (encabezados en la fila 1, una semilla por
+    fila) y hoja 'Léeme' con la explicación de cada columna. Sin registros es la plantilla vacía."""
+    from datetime import datetime
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    registros = list(registros)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Datos"
+    ws.append(ENCABEZADOS_BD)
+    verde, borde = PatternFill("solid", fgColor="059669"), Border(*(Side(style="thin", color="CBD5E1"),) * 4)
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = verde
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = borde
+    ws.row_dimensions[1].height = 30
+    for r in registros:
+        raiz = float(r["longitud_raiz"]) if r.get("longitud_raiz") is not None else None
+        tallo = float(r["longitud_tallo"]) if r.get("longitud_tallo") is not None else None
+        germino = r.get("germino")
+        if germino is None:
+            germino = 1 if ((raiz or 0) > 0 or (tallo or 0) > 0) else 0
+        fecha = r.get("fecha_registro")
+        fecha = fecha.strftime("%Y-%m-%d %H:%M:%S") if hasattr(fecha, "strftime") else str(fecha or "")
+        ws.append(_fila_machote(r, raiz, tallo, germino, fecha))
+        fila = ws.max_row
+        for c in ws[fila]:
+            c.border = borde
+            if fila % 2 == 1:
+                c.fill = PatternFill("solid", fgColor="F8FAFC")
+        ws.cell(fila, 13).font = Font(bold=True, color="059669" if int(germino) == 1 else "DC2626")
+        for col in (11, 12):
+            ws.cell(fila, col).number_format = "0.00"
+    for i, ancho in enumerate([30, 28, 11, 12, 15, 13, 12, 13, 12, 11, 11, 11, 13, 20], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+    ws.freeze_panes = "A2"
+
+    le = wb.create_sheet("Léeme")
+    le["A1"] = titulo or "PLANTILLA BIOGROW — una fila por semilla"
+    le["A1"].font = Font(bold=True, size=13, color="0F172A")
+    if registros:
+        total = len(registros)
+        germ = sum(1 for r in registros if int(r.get("germino") or 0) == 1)
+        le["A2"] = (f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  Muestras: {total}  |  "
+                    f"Germinadas: {germ} ({germ / total * 100:.1f} %)")
+    else:
+        le["A2"] = ("Llena la hoja 'Datos' desde la fila 2. No cambies los encabezados. Esta hoja ('Léeme') "
+                    "la ignora el programa.")
+    le["A2"].font = Font(italic=True, color="475569")
+    le.append([])
+    le.append(["Columna", "Qué poner", "Ejemplo"])
+    for c in le[4]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = verde
+    for fila in DESCRIPCION_COLUMNAS:
+        le.append(list(fila))
+    le.column_dimensions["A"].width = 22
+    le.column_dimensions["B"].width = 80
+    le.column_dimensions["C"].width = 26
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -89,16 +201,50 @@ def leer_base(registros: List[dict]) -> Tuple[pd.DataFrame, List[str]]:
     return df, [a.replace(f"{NOMBRE_BD}: ", "Base de datos: ") for a in avisos]
 
 
+def _hojas_tabla_larga(ruta) -> dict:
+    """Cantidad de hojas por (lote, n.º de semilla) en tablas con una semilla por fila.
+    El motor del dashboard no analiza hojas; solo se usa al importar a la base."""
+    salida = {}
+    try:
+        libros = pd.read_excel(ruta, sheet_name=None)
+    except Exception:
+        return salida
+    for hoja in libros.values():
+        cols = {c: str(c).strip().lower() for c in hoja.columns}
+        c_hojas = next((c for c, t in cols.items() if "hoja" in t and "cant" in t or t in ("hojas", "n.º hojas")), None)
+        c_lote = next((c for c, t in cols.items() if re.search(M._COLUMNAS_LARGO["caja"], t)), None)
+        c_no = next((c for c, t in cols.items() if re.search(M._COLUMNAS_LARGO["no"], t)), None)
+        if not (c_hojas and c_lote and c_no):
+            continue
+        for lote, no, h in zip(hoja[c_lote], hoja[c_no], hoja[c_hojas]):
+            if pd.notna(lote) and pd.notna(no) and pd.notna(h):
+                try:
+                    salida[(re.sub(r"\s+", " ", str(lote).strip()), int(no))] = int(h)
+                except (TypeError, ValueError):
+                    pass
+    return salida
+
+
 def leer_excels(rutas: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     if not rutas:
         return pd.DataFrame(), []
     df, avisos = M.cargar_varios(list(rutas))
     if not df.empty:
         df["Origen"] = "Excel"
+        df["Hojas"] = np.nan
+        for ruta in rutas:
+            nombre = os.path.basename(str(ruta))
+            m = (df["Archivo"] == nombre) & (df["Tipo de experimento"] == M.TIPO_LARGO)
+            if m.any():
+                mapa = _hojas_tabla_larga(ruta)
+                if mapa:
+                    df.loc[m, "Hojas"] = [mapa.get((b, int(n)), np.nan)
+                                          for b, n in zip(df.loc[m, "Bloque"], df.loc[m, "No"])]
     return df, avisos
 
 
-def combinar(df_bd: pd.DataFrame, df_xl: pd.DataFrame, modo: str) -> pd.DataFrame:
+def combinar(df_bd: pd.DataFrame, df_xl: pd.DataFrame, modo: str,
+             nombres_tecnicos: Optional[dict] = None) -> pd.DataFrame:
     """modo: 'Solo MySQL' (base de datos), 'Solo Excel' o 'MySQL + Excel (Combinados)'."""
     if modo.startswith("Solo MySQL"):
         marcos = [df_bd]
@@ -110,7 +256,118 @@ def combinar(df_bd: pd.DataFrame, df_xl: pd.DataFrame, modo: str) -> pd.DataFram
     if not marcos:
         return pd.DataFrame()
     df = pd.concat(marcos, ignore_index=True)
-    return M.variedad_por_color(df)
+    df = aplicar_nombres_tecnicos(M.variedad_por_color(df), nombres_tecnicos or {})
+    return M.agregar_combinacion(df)
+
+
+# ---------------------------------------------------------------------------
+# Nombres técnicos de las variedades (catálogo editable, se guarda en un .json)
+# ---------------------------------------------------------------------------
+
+# Variedades de la captura con su nombre técnico (híbrido) o científico, igual que en la versión de Hibrain.
+TIPOS_SEMILLA = [
+    "Semilla de maíz blanco (PBB-DH-183)",
+    "Semilla de maíz rosa (H-392 A)",
+    "Semilla de maíz cacahuazintle (Zea mays var. amylacea)",
+    "Semilla de maíz criollo (Zea mays nativo)",
+    "Semilla de lenteja (Lens culinaris)",
+]
+
+NOMBRES_TECNICOS_DEFECTO = {"Maíz blanco": "PBB-DH-183", "Maíz rosa": "H-392 A",
+                            "Maíz cacahuazintle": "Zea mays var. amylacea", "Maíz criollo": "Zea mays nativo",
+                            "Lenteja": "Lens culinaris"}
+_VERSION_NOMBRES = 2
+
+
+def separar_nombre(texto) -> Tuple[str, str]:
+    """'Maíz blanco (PBB-DH-183)' -> ('Maíz blanco', 'PBB-DH-183')."""
+    t = re.sub(r"\s+", " ", str(texto or "")).strip()
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", t)
+    return (m.group(1).strip(), m.group(2).strip()) if m else (t, "")
+
+
+def clave_variedad(texto) -> str:
+    """Clave para comparar variedades sin importar el nombre técnico ni el prefijo 'Semilla de':
+    'Semilla de maíz rosa (H-392 A)' y 'Semilla de maíz rosa' dan la misma clave."""
+    base = separar_nombre(texto)[0].lower()
+    return re.sub(r"^semilla\s+de\s+", "", base).strip()
+
+
+def leer_nombres_tecnicos(ruta: str) -> dict:
+    """Catálogo {nombre común: nombre técnico/científico}. Los archivos guardados antes de que hubiera
+    nombres científicos por defecto no borran esos valores con campos vacíos."""
+    import json
+    datos = dict(NOMBRES_TECNICOS_DEFECTO)
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            leido = json.load(f)
+        nuevo = int(leido.get("_version", 1)) >= _VERSION_NOMBRES
+        for k, v in leido.items():
+            if str(k).startswith("_"):
+                continue
+            if str(v).strip() or nuevo or not datos.get(str(k)):
+                datos[str(k)] = str(v)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return datos
+
+
+def guardar_nombres_tecnicos(ruta: str, datos: dict) -> None:
+    import json
+    salida = {"_version": _VERSION_NOMBRES}
+    salida.update({k: v for k, v in datos.items() if not str(k).startswith("_")})
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(salida, f, ensure_ascii=False, indent=2)
+
+
+def aplicar_nombres_tecnicos(df: pd.DataFrame, mapa: dict) -> pd.DataFrame:
+    """'Maíz blanco' -> 'Maíz blanco (PBB-DH-183)'. Un nombre que ya trae su nombre técnico entre
+    paréntesis se agrupa con el mismo nombre sin él (los lotes viejos y los nuevos quedan juntos)."""
+    if df.empty or "Variedad" not in df:
+        return df
+    mapa = {k: v for k, v in (mapa or {}).items() if not str(k).startswith("_")}
+    d = df.copy()
+    def nombre(v):
+        base, propio = separar_nombre(v)
+        t = str(mapa.get(base, "") or "").strip() or propio
+        return f"{base} ({t})" if t else base
+    d["Variedad"] = d["Variedad"].map(nombre)
+    return d
+
+
+def resumen_proyecto(df: pd.DataFrame, fuente: str = "") -> pd.DataFrame:
+    """Tabla corta con la información del proyecto para los exportables."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Dato", "Valor"])
+    def valores(col, quitar=("Sin dato", "No registrada", "Sin anotar", "Control", "nan", "Sin definir")):
+        if col not in df:
+            return "—"
+        v = [str(x) for x in df[col].dropna().astype(str).unique() if str(x) not in quitar]
+        def clave(x):
+            m = re.search(r"\d+(?:\.\d+)?", x)
+            return (float(m.group()) if m else 1e9, x)
+        return ", ".join(sorted(v, key=clave)) or "—"
+    por_lote = df.groupby("Corrida").size()
+    f = pd.to_datetime(df.get("Fecha etiqueta"), errors="coerce", format="mixed").dropna()
+    filas = [
+        ("Fuente de datos", fuente or "—"),
+        ("Variedades", valores("Variedad")),
+        ("Lotes (cajas)", str(df["Corrida"].nunique())),
+        ("Semillas", f"{len(df):,}"),
+        ("Semillas por lote", f"{por_lote.min()}" if por_lote.min() == por_lote.max()
+         else f"{por_lote.min()} a {por_lote.max()}"),
+        ("Tipos de tratamiento", valores("Tipo de tratamiento")),
+        ("Tiempos de tratamiento", ", ".join(M._etiqueta_tratamiento(x) for x in
+                                             sorted(df["Tratamiento (s)"].dropna().unique())) or "—"),
+        ("Temperaturas", valores("Temperatura")),
+        ("Tipos de gas", valores("Gas")),
+        ("Flujos", valores("Flujo")),
+        ("Orientaciones", valores("Orientación")),
+        ("Morfologías", valores("Morfología")),
+        ("Combinaciones de tratamiento", str(df["Combinación"].nunique()) if "Combinación" in df else "—"),
+        ("Fechas de registro", f"{f.min():%Y-%m-%d} a {f.max():%Y-%m-%d}" if len(f) else "—"),
+    ]
+    return pd.DataFrame(filas, columns=["Dato", "Valor"])
 
 
 def unidad_por_defecto(df: pd.DataFrame) -> str:
@@ -154,10 +411,13 @@ def dims_automaticas(df: pd.DataFrame) -> List[str]:
     return dims or ["Tratamiento"]
 
 
-def filtrar(df: pd.DataFrame, variedades_sel=None, tratamiento=None, desde=None, hasta=None) -> pd.DataFrame:
+def filtrar(df: pd.DataFrame, variedades_sel=None, tratamiento=None, desde=None, hasta=None,
+            gas=None) -> pd.DataFrame:
     d = df
     if variedades_sel:
         d = d[d["Variedad"].astype(str).isin(variedades_sel)]
+    if gas:
+        d = d[d["Gas"].astype(str) == gas]
     if tratamiento:
         d = d[d["Tratamiento"].astype(str) == tratamiento]
     if desde or hasta:
@@ -407,3 +667,112 @@ def formatear_tabla(df: pd.DataFrame, dec: int = 3) -> Tuple[List[str], List[Lis
                 fila.append(str(v))
         filas.append(fila)
     return [str(c) for c in cols], filas
+
+
+# ---------------------------------------------------------------------------
+# Importar Excel a la base de datos (pestaña 1)
+# ---------------------------------------------------------------------------
+
+_BLANCO, _ROSA, _CACAHUAZINTLE, _CRIOLLO, _LENTEJA = TIPOS_SEMILLA
+_VARIEDAD_BD = [("blanc", _BLANCO), ("pbb", _BLANCO), ("rosa", _ROSA), ("h-392", _ROSA),
+                ("cacahuazintle", _CACAHUAZINTLE), ("amylacea", _CACAHUAZINTLE), ("criollo", _CRIOLLO),
+                ("lenteja", _LENTEJA), ("lens culinaris", _LENTEJA)]
+_COLOR_BD = {"B": _BLANCO, "R": _ROSA, "C": _CACAHUAZINTLE, "CR": _CRIOLLO, "L": _LENTEJA}
+
+
+def _variedad_bd(color, variedad) -> str:
+    if str(color).upper() in _COLOR_BD:
+        return _COLOR_BD[str(color).upper()]
+    t = str(variedad or "").lower()
+    for clave, nombre in _VARIEDAD_BD:
+        if clave in t:
+            return nombre
+    v = str(variedad or "").strip()
+    return v if v and v != "?" else "Sin especificar"
+
+
+def _tiempo_bd(f) -> str:
+    if str(f.get("Clase", "")) == "S" or f.get("Tratamiento (s)") == 0:
+        return "Control"
+    seg = f.get("Tratamiento (s)")
+    if seg is not None and not pd.isna(seg):
+        return f"{float(seg):g}s"
+    return "Sin definir"
+
+
+def _temperatura_bd(f) -> str:
+    t = f.get("Temperatura registrada")
+    if t is None or pd.isna(t):
+        t = f.get("Temperatura")
+    t = str(t or "").strip()
+    return "Ambiente" if t in ("", "Control", "No registrada", "Sin anotar", "nan") else t
+
+
+def _fecha_bd(f, hoy: str) -> str:
+    fecha = pd.to_datetime(f.get("Fecha etiqueta"), errors="coerce", format="mixed")
+    return fecha.strftime("%Y-%m-%d %H:%M:%S") if not pd.isna(fecha) else hoy
+
+
+def preparar_importacion(df_xl: pd.DataFrame, existentes: set) -> Tuple[list, dict]:
+    """Convierte las cajas de los Excel (formato del motor, en cm) en lotes para la base (en mm).
+    Devuelve (lotes, resumen). No importa cajas vacías, lotes ya registrados ni hojas con un
+    tratamiento por columna (ahí raíz y tallo no son de las mismas semillas)."""
+    from datetime import datetime
+    resumen = {"lotes": 0, "semillas": 0, "repetidos": [], "vacias": 0, "sin_pareja": 0,
+               "fecha_hoy": 0, "archivos": set()}
+    if df_xl is None or df_xl.empty:
+        return [], resumen
+    existentes = {(n, clave_variedad(v)) for n, v in existentes}  # lotes viejos sin nombre científico
+    d = M.variedad_por_color(df_xl)
+    es_col = d["Tipo de experimento"] == M.TIPO_COLUMNAS
+    resumen["sin_pareja"] = int(d.loc[es_col, "Corrida"].nunique())
+    d = d[~es_col]
+    vacias = M.cajas_vacias(d) if not d.empty else set()
+    resumen["vacias"] = len(vacias)
+    d = d[~d["Corrida"].isin(vacias)]
+    hoy = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lotes = []
+    for caja, c in d.groupby("Corrida", sort=False):
+        f = c.iloc[0].to_dict()
+        if f["Tipo de experimento"] == M.TIPO_LARGO:
+            nombre = str(f["Bloque"])
+        else:
+            nombre = f"{f['Bloque']} · rep {f['Réplica']} · {f['Hoja']}"
+        variedad = _variedad_bd(f.get("Color"), f.get("Variedad"))
+        if (nombre, clave_variedad(variedad)) in existentes:
+            resumen["repetidos"].append(nombre)
+            continue
+        fecha = _fecha_bd(f, hoy)
+        resumen["fecha_hoy"] += int(fecha == hoy)
+        mediciones = []
+        for _, s in c.sort_values("No").iterrows():
+            raiz = 0.0 if pd.isna(s["Raíz"]) else round(float(s["Raíz"]) * 10, 2)
+            tallo = 0.0 if pd.isna(s["Tallo"]) else round(float(s["Tallo"]) * 10, 2)
+            germ = s["Germinó"]
+            germ = (1 if (raiz > 0 or tallo > 0) else 0) if pd.isna(germ) else int(germ)
+            hojas = s.get("Hojas")
+            mediciones.append({"num_muestra": int(s["No"]), "longitud_raiz": raiz, "longitud_tallo": tallo,
+                               "cantidad_hojas": None if hojas is None or pd.isna(hojas) else int(hojas),
+                               "germino": germ})
+        # números de semilla únicos dentro del lote (la base no admite repetidos)
+        vistos = set()
+        for k, med in enumerate(mediciones, start=1):
+            if med["num_muestra"] in vistos:
+                med["num_muestra"] = max(vistos) + 1
+            vistos.add(med["num_muestra"])
+        def _fac(col):
+            v = f.get(col)
+            return None if v is None or (isinstance(v, float) and pd.isna(v)) or str(v) in ("Sin dato", "nan") else v
+        flujo = f.get("Flujo (L/min)")
+        lotes.append({"nombre_lote": nombre, "tipo_semilla": variedad, "fecha_registro": fecha,
+                      "gas": _fac("Gas"), "orientacion": _fac("Orientación"), "morfologia": _fac("Morfología"),
+                      "tipo_tratamiento": _fac("Tipo de tratamiento") or "Plasma",
+                      "flujo": None if flujo is None or pd.isna(flujo) else float(flujo),
+                      "cantidad_semillas": len(mediciones),
+                      "tiempo_tratamiento": _tiempo_bd(f), "temperatura": _temperatura_bd(f),
+                      "mediciones": mediciones, "archivo": f.get("Archivo")})
+        existentes.add((nombre, clave_variedad(variedad)))
+        resumen["lotes"] += 1
+        resumen["semillas"] += len(mediciones)
+        resumen["archivos"].add(f.get("Archivo"))
+    return lotes, resumen

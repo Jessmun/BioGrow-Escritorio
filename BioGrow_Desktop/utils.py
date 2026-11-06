@@ -5,6 +5,7 @@ Sin dependencias de UI ni de base de datos.
 """
 
 import math
+import re
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -275,30 +276,29 @@ def validar_temperatura(temperatura_str: str) -> Tuple[bool, str, str]:
         (True, temperatura_formateada, "") si es válido
         (False, "", mensaje_error) si no es válido
     """
+    # Campo abierto: se acepta cualquier texto (ej. '35', '35-40 °C', 'Variable', 'Ambiente').
+    # Solo se da formato cuando es un número solo ('35' -> '35 °C').
     if not temperatura_str or not temperatura_str.strip():
         return True, "Ambiente", ""
 
-    t = temperatura_str.strip()
+    t = " ".join(temperatura_str.split())
     if t.lower() in ("amb", "ambiente", "t. amb", "tamb", "control"):
         return True, "Ambiente", ""
 
-    # Limpiar sufijos como °C, c, °
-    limpio = t.lower().replace("°c", "").replace("ºc", "").replace("°", "").replace("c", "").strip()
-    try:
-        val = float(limpio.replace(",", "."))
-    except ValueError:
-        return False, "", "La temperatura debe ser un número en °C (ej: 35) o 'Ambiente'."
-
-    if val < -20 or val > 150:
-        return False, "", "La temperatura en °C está fuera de un rango válido (-20 a 150 °C)."
-
-    txt_num = f"{int(val)}" if val.is_integer() else f"{val:g}"
-    return True, f"{txt_num} °C", ""
+    simple = re.fullmatch(r"(-?\d+(?:[.,]\d+)?)\s*(?:°\s*c?|º\s*c?|c|grados)?", t, re.IGNORECASE)
+    if simple:
+        val = float(simple.group(1).replace(",", "."))
+        txt_num = f"{int(val)}" if val.is_integer() else f"{val:g}"
+        return True, f"{txt_num} °C", ""
+    if len(t) > 40:
+        return False, "", "La temperatura puede ser cualquier texto, pero de máximo 40 caracteres."
+    return True, t, ""
 
 # ---------------------------------------------------------------------------
 # Factores del tratamiento (gas, flujo, orientación, morfología)
 # ---------------------------------------------------------------------------
 
+TIPOS_TRATAMIENTO = ["Plasma", "Salino", "Térmico", "Solución"]
 TIPOS_GAS = ["Sin gas", "Aire", "Oxígeno", "Helio", "Argón", "Nitrógeno"]
 ORIENTACIONES = ["Aleatorio", "Embrión", "Endospermo"]
 MORFOLOGIAS = ["Plana", "Bola"]

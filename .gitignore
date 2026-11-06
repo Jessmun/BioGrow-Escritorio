@@ -8,3 +8,7 @@ dist/
 
 # Lista local de Excel recordados por la app (rutas de cada computadora)
 biogrow_excels.json
+
+# Base de datos local (cada equipo tiene sus propios registros) y Python compilado
+biogrow.db
+*.pyc
